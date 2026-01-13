@@ -1,0 +1,18 @@
+# Environnements Python
+venv/
+__pycache__/
+*.pyc
+
+# Fichiers locaux
+.DS_Store
+.env
+logs/
+
+# Docker (si utilisé)
+*.log
+*.pid
+*.sock
+
+# IDE / éditeurs
+.vscode/
+.idea/

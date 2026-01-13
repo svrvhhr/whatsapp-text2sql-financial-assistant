@@ -1,0 +1,10 @@
+{
+  "sql_contains": [
+    "SELECT",
+    "depenses",
+    "2025"
+  ]
+}
+
+// On ne compare pas le SQL exact (LLM ≠ déterministe)
+// On vérifie que la requête est cohérente avec la demande utilisateur 
