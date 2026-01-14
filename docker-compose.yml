@@ -10,10 +10,9 @@ services:
     container_name: orionis-postgres
     restart: always
     environment:
-      POSTGRES_USER: orionis
-      POSTGRES_PASSWORD: orionis
-      POSTGRES_DB: orionis
-      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
       - postgres_data:/var/lib/postgresql/data
