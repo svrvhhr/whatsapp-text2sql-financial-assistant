@@ -3,7 +3,10 @@ uvicorn
 psycopg2-binary
 python-dotenv
 requests
-pytest
-sqlglot
+
+# tests
 pytest
 httpx
+
+# AST SQL validation
+sqlglot

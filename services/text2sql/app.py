@@ -7,7 +7,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg2
 import requests
 from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
+
+import sqlglot
+from sqlglot import exp
 
 
 # =========================================================
@@ -16,40 +20,50 @@ from pydantic import BaseModel, Field
 POSTGRES_DB = os.getenv("POSTGRES_DB", "orionis")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "orionis")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "orionis")
-POSTGRES_HOST = os.getenv("POSTGRES_HOST", "orionis-postgres")  # service name docker
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "orionis-postgres")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3:mini")
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
 
 ENV = os.getenv("ENV", "dev")
+
+# Mode test (si tu veux plus tard)
+TEXT2SQL_STUB_LLM = os.getenv("TEXT2SQL_STUB_LLM", "0") == "1"
 
 
 # =========================================================
 # FastAPI
 # =========================================================
-app = FastAPI(title="Text2SQL Service", version="2.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup
+    ensure_schema_loaded()
+    yield
+    # shutdown (rien à faire pour l’instant)
+
+app = FastAPI(title="Text2SQL Service", version="2.1.0", lifespan=lifespan)
 
 
 # =========================================================
 # Models
 # =========================================================
 class ConvertRequest(BaseModel):
-    user_input: str = Field(..., min_length=1, description="Message utilisateur en langage naturel")
-    # Optionnel: contexte (multi-entité) si besoin plus tard
+    user_input: str = Field(..., min_length=1)
     entreprise_id: Optional[int] = None
     projet_id: Optional[int] = None
-    role: Optional[str] = None  # ex: admin_financier / responsable_projet / lecture_seule
+    role: Optional[str] = None
 
 
 class ConvertResponse(BaseModel):
-    operation: str  # SELECT / INSERT / UPDATE / DELETE / UNKNOWN
+    operation: str
     sql: str
     params: List[Any]
     tables: List[str]
     needs_approval: bool
-    risk_level: str  # low / medium / high
+    risk_level: str
     notes: List[str] = []
 
 
@@ -72,10 +86,6 @@ def _pg_connect():
 
 
 def load_schema_mapping(retries: int = 20, sleep_s: float = 1.0) -> Dict[str, Any]:
-    """
-    Lit le schéma depuis information_schema (read-only).
-    Retry utile au démarrage (postgres pas encore prêt).
-    """
     last_err = None
     for _ in range(retries):
         try:
@@ -117,32 +127,12 @@ def ensure_schema_loaded() -> None:
 # Safety / Validation helpers
 # =========================================================
 _SQL_START_RE = re.compile(r"^\s*(SELECT|INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
-_FORBIDDEN = [
-    r"\bDROP\b",
-    r"\bTRUNCATE\b",
-    r"\bALTER\b",
-    r"\bGRANT\b",
-    r"\bREVOKE\b",
-    r"\bCREATE\b",
-]
+_FORBIDDEN = [r"\bDROP\b", r"\bTRUNCATE\b", r"\bALTER\b", r"\bGRANT\b", r"\bREVOKE\b", r"\bCREATE\b"]
 
 
 def classify_operation(sql: str) -> str:
     m = _SQL_START_RE.search(sql or "")
     return (m.group(1).upper() if m else "UNKNOWN")
-
-
-def extract_tables(sql: str, known_tables: List[str]) -> List[str]:
-    """
-    Extraction simple basée sur matching de noms connus.
-    (On fera plus robuste plus tard avec sqlglot dans sql-guard.)
-    """
-    s = (sql or "").lower()
-    found = []
-    for t in known_tables:
-        if re.search(rf"\b{re.escape(t.lower())}\b", s):
-            found.append(t)
-    return sorted(set(found))
 
 
 def contains_forbidden(sql: str) -> bool:
@@ -151,11 +141,6 @@ def contains_forbidden(sql: str) -> bool:
 
 
 def risk_level_for(op: str) -> Tuple[str, bool]:
-    """
-    Policy simple:
-      - SELECT => low, pas besoin d'approbation (mais sera quand même validé par sql-guard côté archi)
-      - INSERT/UPDATE/DELETE => high, needs_approval=True
-    """
     op = op.upper()
     if op == "SELECT":
         return "low", False
@@ -165,16 +150,121 @@ def risk_level_for(op: str) -> Tuple[str, bool]:
 
 
 # =========================================================
-# LLM (Ollama) - generation JSON ONLY
+# SQLGLOT static checks (AST + whitelist)
+# =========================================================
+def parse_sql_ast(sql: str) -> exp.Expression:
+    try:
+        return sqlglot.parse_one(sql, read="postgres")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"SQL invalide (parse AST): {e}")
+
+
+def ast_operation(node: exp.Expression) -> str:
+    if isinstance(node, exp.Select):
+        return "SELECT"
+    if isinstance(node, exp.Insert):
+        return "INSERT"
+    if isinstance(node, exp.Update):
+        return "UPDATE"
+    if isinstance(node, exp.Delete):
+        return "DELETE"
+    return "UNKNOWN"
+
+
+def extract_tables_ast(node: exp.Expression) -> List[str]:
+    tables = []
+    for t in node.find_all(exp.Table):
+        if t.name:
+            tables.append(t.name)
+    return sorted(set(tables))
+
+
+def extract_columns_ast(node: exp.Expression) -> List[Tuple[Optional[str], str]]:
+    cols = []
+    for c in node.find_all(exp.Column):
+        cols.append((c.table, c.name))
+    return cols
+
+
+def whitelist_validate_ast(sql: str, schema: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    """
+    - Parse SQL with sqlglot
+    - Ensure tables exist in schema
+    - Ensure columns exist (when resolvable)
+    Returns: (tables, notes)
+    """
+    notes: List[str] = []
+    node = parse_sql_ast(sql)
+
+    op = ast_operation(node)
+    if op == "UNKNOWN":
+        notes.append("Opération AST inconnue.")
+
+    tables = extract_tables_ast(node)
+    for t in tables:
+        if t not in schema:
+            raise HTTPException(status_code=400, detail=f"Table non autorisée/inconnue: {t}")
+
+    # Column checks (best-effort, ignore '*' and unqualified columns without table when ambiguous)
+    schema_cols = {t: set(schema[t]["columns"]) for t in schema}
+    for tbl, col in extract_columns_ast(node):
+        if col == "*":
+            continue
+        if tbl and tbl in schema_cols:
+            if col not in schema_cols[tbl]:
+                raise HTTPException(status_code=400, detail=f"Colonne inconnue: {tbl}.{col}")
+
+    return tables, notes
+
+
+# =========================================================
+# Schema linking / rewrite (deterministic fixes)
+# =========================================================
+def rewrite_common_semantic_errors(sql: str, params: List[Any], notes: List[str]) -> Tuple[str, List[Any]]:
+    """
+    Fix deterministic known mapping issues:
+    - depense.projet_id compared to a project name => rewrite to JOIN projet on p.nom
+    """
+    # Pattern: SELECT ... FROM depense ... WHERE projet_id = %s
+    if re.search(r"\bFROM\s+depense\b", sql, flags=re.IGNORECASE) and re.search(
+        r"\bprojet_id\s*=\s*%s\b", sql, flags=re.IGNORECASE
+    ):
+        if params and isinstance(params[0], str):
+            notes.append("Rewrite: projet_id attendu int, param est str => JOIN projet p ON p.id = d.projet_id WHERE p.nom = %s")
+            # naive rewrite: replace "depense" alias with d
+            # We'll generate deterministic query instead of trying to patch arbitrary SQL
+            sql = "SELECT d.* FROM depense d JOIN projet p ON p.id = d.projet_id WHERE p.nom = %s;"
+            # keep params as-is (project name)
+            return sql, params
+
+    return sql, params
+
+
+# =========================================================
+# LLM prompt (few-shot + schema grounding)
 # =========================================================
 def build_llm_prompt(user_input: str, schema: Dict[str, Any], context: Dict[str, Any]) -> str:
-    """
-    On force le modèle à produire un JSON strict: {operation, sql, params}
-    - SQL paramétré (placeholders %s)
-    - params = liste (types simples)
-    - SQL limité au schéma fourni
-    """
     schema_min = {t: v["columns"] for t, v in schema.items()}
+
+    # few-shot minimal (deterministic patterns)
+    few_shot = [
+        {
+            "user": "Montre les dépenses du projet Alpha",
+            "assistant": {
+                "operation": "SELECT",
+                "sql": "SELECT d.* FROM depense d JOIN projet p ON p.id = d.projet_id WHERE p.nom = %s;",
+                "params": ["Alpha"],
+            },
+        },
+        {
+            "user": "Montre les factures PAYEE du projet Beta",
+            "assistant": {
+                "operation": "SELECT",
+                "sql": "SELECT f.* FROM facture f JOIN projet p ON p.id = f.projet_id WHERE p.nom = %s AND f.statut = %s;",
+                "params": ["Beta", "PAYEE"],
+            },
+        },
+    ]
 
     rules = [
         "Tu es un assistant Text2SQL pour Postgres.",
@@ -183,8 +273,7 @@ def build_llm_prompt(user_input: str, schema: Dict[str, Any], context: Dict[str,
         "Le champ params est une liste ordonnée correspondant aux %s.",
         "N'utilise QUE les tables/colonnes présentes dans le schéma fourni.",
         "N'écris JAMAIS de SQL dangereux: pas de DROP/TRUNCATE/ALTER/GRANT/REVOKE/CREATE.",
-        "Si la demande est ambiguë, fais au mieux avec un SELECT et ajoute une note dans params? NON: reste en JSON, et mets operation='SELECT' ou 'UNKNOWN' et une requête neutre.",
-        "Pour INSERT/UPDATE/DELETE, renvoie quand même la requête paramétrée (sans l'exécuter).",
+        "Si l'utilisateur mentionne un projet par NOM, utilise la table projet (JOIN) plutôt que projet_id = 'nom'.",
     ]
 
     ctx_lines = []
@@ -198,6 +287,9 @@ RÈGLES:
 
 CONTEXTE:
 {chr(10).join(ctx_lines) if ctx_lines else "- (aucun)"}
+
+EXEMPLES (few-shot):
+{json.dumps(few_shot, ensure_ascii=False, indent=2)}
 
 SCHÉMA (JSON):
 {json.dumps(schema_min, ensure_ascii=False)}
@@ -225,31 +317,25 @@ def call_ollama(prompt: str) -> Dict[str, Any]:
         "model": OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
-        "format": "json",  # Ollama: tente de forcer JSON (selon versions)
-        "options": {
-            "temperature": 0.0,
-        },
+        "format": "json",
+        "options": {"temperature": 0.0},
     }
 
-    r = requests.post(url, json=payload, timeout=60)
+    r = requests.post(url, json=payload, timeout=OLLAMA_TIMEOUT)
     if r.status_code != 200:
         raise RuntimeError(f"Ollama error {r.status_code}: {r.text}")
 
     data = r.json()
-
-    # Ollama renvoie souvent {"response": "..."} contenant du JSON texte
-    raw = data.get("response", "").strip()
+    raw = (data.get("response", "") or "").strip()
     if not raw:
         raise RuntimeError("Ollama a renvoyé une réponse vide.")
 
-    # Certains modèles ajoutent des fences ```json ... ```
     raw = re.sub(r"^```json\s*", "", raw, flags=re.IGNORECASE)
     raw = re.sub(r"^```\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
 
     try:
-        obj = json.loads(raw)
-        return obj
+        return json.loads(raw)
     except Exception as e:
         raise RuntimeError(f"Réponse LLM non-JSON ou invalide: {e}. Raw={raw[:500]}")
 
@@ -260,22 +346,14 @@ def normalize_llm_output(obj: Dict[str, Any]) -> Tuple[str, str, List[Any]]:
     params = obj.get("params", [])
     if not isinstance(params, list):
         params = []
-
-    # Fallback si operation manquante
     if operation not in ("SELECT", "INSERT", "UPDATE", "DELETE", "UNKNOWN"):
         operation = classify_operation(sql)
-
     return operation, sql, params
 
 
 # =========================================================
 # API endpoints
 # =========================================================
-@app.on_event("startup")
-def _startup():
-    # Charge le schéma dès le démarrage (avec retry)
-    ensure_schema_loaded()
-
 
 @app.get("/health")
 def health():
@@ -287,30 +365,16 @@ def health():
         "schema_last_load_ts": _SCHEMA_LAST_LOAD_TS,
         "llm_provider": LLM_PROVIDER,
         "ollama_model": OLLAMA_MODEL,
+        "ollama_timeout": OLLAMA_TIMEOUT,
+        "stub_llm": TEXT2SQL_STUB_LLM,
     }
-
-
-@app.get("/schema")
-def schema():
-    ensure_schema_loaded()
-    return {
-        "tables": sorted(_SCHEMA_CACHE.keys()),
-        "schema": _SCHEMA_CACHE,
-        "last_load_ts": _SCHEMA_LAST_LOAD_TS,
-    }
-
-
-@app.post("/refresh-schema")
-def refresh_schema():
-    global _SCHEMA_CACHE, _SCHEMA_LAST_LOAD_TS
-    _SCHEMA_CACHE = load_schema_mapping()
-    _SCHEMA_LAST_LOAD_TS = time.time()
-    return {"ok": True, "tables": sorted(_SCHEMA_CACHE.keys()), "last_load_ts": _SCHEMA_LAST_LOAD_TS}
 
 
 @app.post("/convert", response_model=ConvertResponse)
 def convert(req: ConvertRequest):
     ensure_schema_loaded()
+
+    notes: List[str] = []
 
     context = {
         "entreprise_id": req.entreprise_id,
@@ -319,14 +383,21 @@ def convert(req: ConvertRequest):
     }
 
     prompt = build_llm_prompt(req.user_input, _SCHEMA_CACHE, context)
-    try:
-        llm_obj = call_ollama(prompt)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur LLM: {e}")
+
+    if TEXT2SQL_STUB_LLM:
+        llm_obj = {
+            "operation": "SELECT",
+            "sql": "SELECT d.* FROM depense d JOIN projet p ON p.id = d.projet_id WHERE p.nom = %s;",
+            "params": ["Alpha"],
+        }
+        notes.append("STUB_LLM actif (pas d'appel Ollama).")
+    else:
+        try:
+            llm_obj = call_ollama(prompt)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Erreur LLM: {e}")
 
     operation, sql, params = normalize_llm_output(llm_obj)
-
-    notes: List[str] = []
 
     if not sql:
         raise HTTPException(status_code=400, detail="Le modèle n'a pas produit de SQL.")
@@ -334,22 +405,26 @@ def convert(req: ConvertRequest):
     if contains_forbidden(sql):
         raise HTTPException(status_code=400, detail="SQL refusé: contient une commande interdite (DDL/DCL).")
 
-    # Tables
-    tables = extract_tables(sql, list(_SCHEMA_CACHE.keys()))
-    if not tables:
-        notes.append("Aucune table détectée (vérifie la requête / schéma).")
+    # Deterministic rewrite for common schema-link issues
+    sql, params = rewrite_common_semantic_errors(sql, params, notes)
+
+    # AST whitelist validation (tables/columns)
+    tables, ast_notes = whitelist_validate_ast(sql, _SCHEMA_CACHE)
+    notes.extend(ast_notes)
 
     # Risk / approval
+    op_from_ast = ast_operation(parse_sql_ast(sql))
+    if operation == "UNKNOWN":
+        operation = op_from_ast
+
     risk, needs_approval = risk_level_for(operation)
 
-    # Guard minimal: si DELETE/UPDATE sans WHERE => toujours risky
-    if operation in ("UPDATE", "DELETE"):
-        if re.search(r"\bWHERE\b", sql, flags=re.IGNORECASE) is None:
-            needs_approval = True
-            risk = "high"
-            notes.append(f"{operation} sans WHERE détecté: doit être bloqué côté sql-guard.")
+    # Guard minimal: UPDATE/DELETE without WHERE
+    if operation in ("UPDATE", "DELETE") and re.search(r"\bWHERE\b", sql, flags=re.IGNORECASE) is None:
+        needs_approval = True
+        risk = "high"
+        notes.append(f"{operation} sans WHERE détecté: doit être bloqué côté sql-guard.")
 
-    # IMPORTANT: Ce service N'EXÉCUTE JAMAIS la requête.
     return ConvertResponse(
         operation=operation,
         sql=sql,
