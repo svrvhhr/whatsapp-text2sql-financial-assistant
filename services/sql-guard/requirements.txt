@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+psycopg2-binary
+python-dotenv
+requests
+
+# tests
+pytest
+httpx
+
+# AST SQL validation
+sqlglot
+pydantic

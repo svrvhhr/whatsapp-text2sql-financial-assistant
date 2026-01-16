@@ -33,7 +33,7 @@ services:
     depends_on:
       - postgres
       - text2sql
-      # - sql-guard
+      - sql-guard
       # - sql-executor
       # - audit
 
@@ -60,17 +60,27 @@ services:
     env_file:
       - .env
     ports:
-      - "8001:8001"
+      - "8001:8000"
     depends_on:
       - ollama
+      - postgres
 
   # =========================
   # SQL Guard (Security & Roles)
   # =========================
-  # sql-guard:
-  #   build: ./services/sql-guard
-  #   container_name: sql-guard
-  #   restart: always
+  sql-guard:
+    build: ./services/sql-guard
+    container_name: sql-guard
+    restart: always
+    env_file:
+      - .env
+    environment:
+      GUARD_AUTO_LIMIT: "1"
+      GUARD_MAX_ROWS: "200"
+    ports:
+      - "8002:8000"
+    depends_on:
+      - postgres
 
   # # =========================
   # # SQL Executor (ONLY DB ACCESS)

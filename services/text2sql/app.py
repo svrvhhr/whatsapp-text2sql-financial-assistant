@@ -2,6 +2,7 @@ import os
 import re
 import time
 import json
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2
@@ -30,8 +31,12 @@ OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
 
 ENV = os.getenv("ENV", "dev")
 
-# Mode test (si tu veux plus tard)
-TEXT2SQL_STUB_LLM = os.getenv("TEXT2SQL_STUB_LLM", "0") == "1"
+# Refresh schema cache (seconds). 0 => never refresh after startup.
+SCHEMA_REFRESH_SECONDS = int(os.getenv("SCHEMA_REFRESH_SECONDS", "0"))
+
+# If True: Text2SQL returns schema errors as notes (soft-fail) instead of HTTP 400.
+# Recommended for your architecture (guard decides final).
+TEXT2SQL_SOFT_SCHEMA_FAIL = os.getenv("TEXT2SQL_SOFT_SCHEMA_FAIL", "1") == "1"
 
 
 # =========================================================
@@ -39,31 +44,46 @@ TEXT2SQL_STUB_LLM = os.getenv("TEXT2SQL_STUB_LLM", "0") == "1"
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # startup
-    ensure_schema_loaded()
+    ensure_schema_loaded(force=True)
     yield
-    # shutdown (rien à faire pour l’instant)
 
-app = FastAPI(title="Text2SQL Service", version="2.1.0", lifespan=lifespan)
+
+app = FastAPI(title="Text2SQL Service", version="2.2.0", lifespan=lifespan)
 
 
 # =========================================================
-# Models
+# Models: SQLPlan
 # =========================================================
 class ConvertRequest(BaseModel):
     user_input: str = Field(..., min_length=1)
     entreprise_id: Optional[int] = None
     projet_id: Optional[int] = None
     role: Optional[str] = None
+    actor_id: Optional[str] = None  # ex: whatsapp phone
 
 
-class ConvertResponse(BaseModel):
+class RiskInfo(BaseModel):
+    level: str  # low|medium|high
+    needs_approval: bool
+
+
+class StaticChecks(BaseModel):
+    ast_parsed: bool = False
+    ddl_blocked: bool = True
+    schema_ok: bool = True
+    single_statement: bool = True
+
+
+class SQLPlan(BaseModel):
+    request_id: str
+    user_input: str
     operation: str
     sql: str
     params: List[Any]
     tables: List[str]
-    needs_approval: bool
-    risk_level: str
+    risk: RiskInfo
+    static_checks: StaticChecks
+    context: Dict[str, Any]
     notes: List[str] = []
 
 
@@ -116,18 +136,34 @@ def load_schema_mapping(retries: int = 20, sleep_s: float = 1.0) -> Dict[str, An
     raise RuntimeError(f"Impossible de charger le schéma PostgreSQL: {last_err}")
 
 
-def ensure_schema_loaded() -> None:
+def ensure_schema_loaded(force: bool = False) -> None:
     global _SCHEMA_CACHE, _SCHEMA_LAST_LOAD_TS
-    if not _SCHEMA_CACHE:
+    now = time.time()
+
+    if force or not _SCHEMA_CACHE:
         _SCHEMA_CACHE = load_schema_mapping()
-        _SCHEMA_LAST_LOAD_TS = time.time()
+        _SCHEMA_LAST_LOAD_TS = now
+        return
+
+    if SCHEMA_REFRESH_SECONDS > 0 and _SCHEMA_LAST_LOAD_TS is not None:
+        if now - _SCHEMA_LAST_LOAD_TS >= SCHEMA_REFRESH_SECONDS:
+            _SCHEMA_CACHE = load_schema_mapping()
+            _SCHEMA_LAST_LOAD_TS = now
 
 
 # =========================================================
-# Safety / Validation helpers
+# Safety helpers
 # =========================================================
 _SQL_START_RE = re.compile(r"^\s*(SELECT|INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
-_FORBIDDEN = [r"\bDROP\b", r"\bTRUNCATE\b", r"\bALTER\b", r"\bGRANT\b", r"\bREVOKE\b", r"\bCREATE\b"]
+_FORBIDDEN = [
+    r"\bDROP\b",
+    r"\bTRUNCATE\b",
+    r"\bALTER\b",
+    r"\bGRANT\b",
+    r"\bREVOKE\b",
+    r"\bCREATE\b",
+]
+_MULTI_STATEMENT = re.compile(r";\s*\S+", re.DOTALL)
 
 
 def classify_operation(sql: str) -> str:
@@ -140,6 +176,17 @@ def contains_forbidden(sql: str) -> bool:
     return any(re.search(pat, s, flags=re.IGNORECASE) for pat in _FORBIDDEN)
 
 
+def seems_multi_statement(sql: str) -> bool:
+    # Heuristic: "something; something"
+    if not sql:
+        return False
+    stripped = sql.strip()
+    # allow trailing semicolon only
+    if stripped.endswith(";"):
+        stripped = stripped[:-1]
+    return bool(_MULTI_STATEMENT.search(stripped))
+
+
 def risk_level_for(op: str) -> Tuple[str, bool]:
     op = op.upper()
     if op == "SELECT":
@@ -150,7 +197,7 @@ def risk_level_for(op: str) -> Tuple[str, bool]:
 
 
 # =========================================================
-# SQLGLOT static checks (AST + whitelist)
+# SQLGLOT "light" static analysis
 # =========================================================
 def parse_sql_ast(sql: str) -> exp.Expression:
     try:
@@ -186,35 +233,39 @@ def extract_columns_ast(node: exp.Expression) -> List[Tuple[Optional[str], str]]
     return cols
 
 
-def whitelist_validate_ast(sql: str, schema: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+def static_analyze_ast(sql: str, schema: Dict[str, Any]) -> Tuple[List[str], bool, List[str], bool]:
     """
-    - Parse SQL with sqlglot
-    - Ensure tables exist in schema
-    - Ensure columns exist (when resolvable)
-    Returns: (tables, notes)
+    Light static checks:
+    - AST parse ok
+    - Tables exist?
+    - Columns exist when qualified (best-effort)
+    Returns: (tables, schema_ok, notes, ast_parsed)
     """
     notes: List[str] = []
-    node = parse_sql_ast(sql)
+    schema_ok = True
 
-    op = ast_operation(node)
-    if op == "UNKNOWN":
-        notes.append("Opération AST inconnue.")
+    try:
+        node = parse_sql_ast(sql)
+    except HTTPException as e:
+        return [], False, [str(e.detail)], False
 
     tables = extract_tables_ast(node)
+
     for t in tables:
         if t not in schema:
-            raise HTTPException(status_code=400, detail=f"Table non autorisée/inconnue: {t}")
+            schema_ok = False
+            notes.append(f"Pré-check schéma: table inconnue '{t}'")
 
-    # Column checks (best-effort, ignore '*' and unqualified columns without table when ambiguous)
     schema_cols = {t: set(schema[t]["columns"]) for t in schema}
     for tbl, col in extract_columns_ast(node):
         if col == "*":
             continue
         if tbl and tbl in schema_cols:
             if col not in schema_cols[tbl]:
-                raise HTTPException(status_code=400, detail=f"Colonne inconnue: {tbl}.{col}")
+                schema_ok = False
+                notes.append(f"Pré-check schéma: colonne inconnue '{tbl}.{col}'")
 
-    return tables, notes
+    return tables, schema_ok, notes, True
 
 
 # =========================================================
@@ -222,19 +273,19 @@ def whitelist_validate_ast(sql: str, schema: Dict[str, Any]) -> Tuple[List[str],
 # =========================================================
 def rewrite_common_semantic_errors(sql: str, params: List[Any], notes: List[str]) -> Tuple[str, List[Any]]:
     """
-    Fix deterministic known mapping issues:
-    - depense.projet_id compared to a project name => rewrite to JOIN projet on p.nom
+    Fix deterministic known mapping issues.
+    Example:
+    - depense.projet_id compared to project name => rewrite to JOIN projet on p.nom
     """
-    # Pattern: SELECT ... FROM depense ... WHERE projet_id = %s
     if re.search(r"\bFROM\s+depense\b", sql, flags=re.IGNORECASE) and re.search(
         r"\bprojet_id\s*=\s*%s\b", sql, flags=re.IGNORECASE
     ):
         if params and isinstance(params[0], str):
-            notes.append("Rewrite: projet_id attendu int, param est str => JOIN projet p ON p.id = d.projet_id WHERE p.nom = %s")
-            # naive rewrite: replace "depense" alias with d
-            # We'll generate deterministic query instead of trying to patch arbitrary SQL
+            notes.append(
+                "Rewrite: projet_id attendu int, param est str => "
+                "JOIN projet p ON p.id = d.projet_id WHERE p.nom = %s"
+            )
             sql = "SELECT d.* FROM depense d JOIN projet p ON p.id = d.projet_id WHERE p.nom = %s;"
-            # keep params as-is (project name)
             return sql, params
 
     return sql, params
@@ -246,7 +297,6 @@ def rewrite_common_semantic_errors(sql: str, params: List[Any], notes: List[str]
 def build_llm_prompt(user_input: str, schema: Dict[str, Any], context: Dict[str, Any]) -> str:
     schema_min = {t: v["columns"] for t, v in schema.items()}
 
-    # few-shot minimal (deterministic patterns)
     few_shot = [
         {
             "user": "Montre les dépenses du projet Alpha",
@@ -273,6 +323,7 @@ def build_llm_prompt(user_input: str, schema: Dict[str, Any], context: Dict[str,
         "Le champ params est une liste ordonnée correspondant aux %s.",
         "N'utilise QUE les tables/colonnes présentes dans le schéma fourni.",
         "N'écris JAMAIS de SQL dangereux: pas de DROP/TRUNCATE/ALTER/GRANT/REVOKE/CREATE.",
+        "Une seule requête SQL (pas de multi-statements).",
         "Si l'utilisateur mentionne un projet par NOM, utilise la table projet (JOIN) plutôt que projet_id = 'nom'.",
     ]
 
@@ -330,6 +381,7 @@ def call_ollama(prompt: str) -> Dict[str, Any]:
     if not raw:
         raise RuntimeError("Ollama a renvoyé une réponse vide.")
 
+    # cleanup fences if any
     raw = re.sub(r"^```json\s*", "", raw, flags=re.IGNORECASE)
     raw = re.sub(r"^```\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
@@ -354,7 +406,6 @@ def normalize_llm_output(obj: Dict[str, Any]) -> Tuple[str, str, List[Any]]:
 # =========================================================
 # API endpoints
 # =========================================================
-
 @app.get("/health")
 def health():
     return {
@@ -367,10 +418,12 @@ def health():
         "ollama_model": OLLAMA_MODEL,
         "ollama_timeout": OLLAMA_TIMEOUT,
         "stub_llm": TEXT2SQL_STUB_LLM,
+        "soft_schema_fail": TEXT2SQL_SOFT_SCHEMA_FAIL,
+        "schema_refresh_seconds": SCHEMA_REFRESH_SECONDS,
     }
 
 
-@app.post("/convert", response_model=ConvertResponse)
+@app.post("/convert", response_model=SQLPlan)
 def convert(req: ConvertRequest):
     ensure_schema_loaded()
 
@@ -380,11 +433,16 @@ def convert(req: ConvertRequest):
         "entreprise_id": req.entreprise_id,
         "projet_id": req.projet_id,
         "role": req.role,
+        "actor_id": req.actor_id,
+        "channel": "whatsapp",
     }
 
     prompt = build_llm_prompt(req.user_input, _SCHEMA_CACHE, context)
 
-    if TEXT2SQL_STUB_LLM:
+    # Check stub LLM dynamically to allow test monkeypatching
+    use_stub = os.getenv("TEXT2SQL_STUB_LLM", "0") == "1"
+    
+    if use_stub:
         llm_obj = {
             "operation": "SELECT",
             "sql": "SELECT d.* FROM depense d JOIN projet p ON p.id = d.projet_id WHERE p.nom = %s;",
@@ -402,35 +460,67 @@ def convert(req: ConvertRequest):
     if not sql:
         raise HTTPException(status_code=400, detail="Le modèle n'a pas produit de SQL.")
 
+    # Hard safety: forbid DDL/DCL early
     if contains_forbidden(sql):
         raise HTTPException(status_code=400, detail="SQL refusé: contient une commande interdite (DDL/DCL).")
 
-    # Deterministic rewrite for common schema-link issues
+    # Hard safety: multi-statement early
+    single_stmt = not seems_multi_statement(sql)
+    if not single_stmt:
+        raise HTTPException(status_code=400, detail="SQL refusé: multi-statements détectés.")
+
+    # Deterministic rewrite
     sql, params = rewrite_common_semantic_errors(sql, params, notes)
 
-    # AST whitelist validation (tables/columns)
-    tables, ast_notes = whitelist_validate_ast(sql, _SCHEMA_CACHE)
-    notes.extend(ast_notes)
+    # Light static analysis (soft)
+    tables, schema_ok, static_notes, ast_parsed = static_analyze_ast(sql, _SCHEMA_CACHE)
+    notes.extend(static_notes)
 
-    # Risk / approval
-    op_from_ast = ast_operation(parse_sql_ast(sql))
-    if operation == "UNKNOWN":
-        operation = op_from_ast
+    # Operation & risk suggestion
+    # If LLM said UNKNOWN, infer from AST when possible
+    op_ast = "UNKNOWN"
+    if ast_parsed:
+        try:
+            node = parse_sql_ast(sql)
+            op_ast = ast_operation(node)
+        except Exception:
+            op_ast = "UNKNOWN"
+
+    if operation == "UNKNOWN" and op_ast != "UNKNOWN":
+        operation = op_ast
 
     risk, needs_approval = risk_level_for(operation)
 
-    # Guard minimal: UPDATE/DELETE without WHERE
+    # If schema looks wrong => bump risk (but do not block: guard will decide final)
+    if not schema_ok:
+        risk = "high"
+        needs_approval = True
+        notes.append("Pré-check schéma KO => le sql-guard doit refuser ou demander correction.")
+
+        if not TEXT2SQL_SOFT_SCHEMA_FAIL:
+            raise HTTPException(status_code=400, detail="Schéma invalide (pré-check).")
+
+    # Suggest approval if UPDATE/DELETE without WHERE (still: guard must enforce)
     if operation in ("UPDATE", "DELETE") and re.search(r"\bWHERE\b", sql, flags=re.IGNORECASE) is None:
         needs_approval = True
         risk = "high"
-        notes.append(f"{operation} sans WHERE détecté: doit être bloqué côté sql-guard.")
+        notes.append(f"Pré-check: {operation} sans WHERE détecté (doit être bloqué par sql-guard).")
 
-    return ConvertResponse(
+    plan = SQLPlan(
+        request_id=str(uuid.uuid4()),
+        user_input=req.user_input,
         operation=operation,
         sql=sql,
         params=params,
         tables=tables,
-        needs_approval=needs_approval,
-        risk_level=risk,
+        risk=RiskInfo(level=risk, needs_approval=needs_approval),
+        static_checks=StaticChecks(
+            ast_parsed=ast_parsed,
+            ddl_blocked=True,
+            schema_ok=schema_ok,
+            single_statement=single_stmt,
+        ),
+        context=context,
         notes=notes,
     )
+    return plan

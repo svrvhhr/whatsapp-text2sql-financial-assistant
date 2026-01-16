@@ -1,15 +1,19 @@
-from fastapi.testclient import TestClient
-import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import app as text2sql_app
+import sys
+import pytest
+from pathlib import Path
+from fastapi.testclient import TestClient
 
+# Add parent directory to path so we can import app
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import app as text2sql_app
 
 client = TestClient(text2sql_app.app)
 
 
 def test_convert_select_schema_linking(monkeypatch):
-    # Mock LLM output (pour tester sans Ollama)
+    monkeypatch.setenv("TEXT2SQL_STUB_LLM", "0")
+
     def fake_call_ollama(prompt: str):
         return {
             "operation": "SELECT",
@@ -28,16 +32,24 @@ def test_convert_select_schema_linking(monkeypatch):
     assert data["params"] == ["Alpha"]
     assert "depense" in data["tables"]
     assert "projet" in data["tables"]
-    assert data["needs_approval"] is False
-    assert data["risk_level"] == "low"
+
+    # SQLPlan => risk.needs_approval
+    assert data["risk"]["needs_approval"] is False
+    assert data["risk"]["level"] == "low"
 
 
 def test_convert_insert_needs_approval(monkeypatch):
-    # Mock LLM output (INSERT)
+    # IMPORTANT: désactiver le stub sinon call_ollama n'est jamais appelé
+    monkeypatch.setenv("TEXT2SQL_STUB_LLM", "0")
+
     def fake_call_ollama(prompt: str):
         return {
             "operation": "INSERT",
-            "sql": "INSERT INTO depense (projet_id, compte_id, type_depense, montant, devise, description, date_depense) VALUES (%s,%s,%s,%s,%s,%s,%s);",
+            "sql": (
+                "INSERT INTO depense "
+                "(projet_id, compte_id, type_depense, montant, devise, description, date_depense) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s);"
+            ),
             "params": [1, 1, "cloud", 220.0, "EUR", "test", "2025-05-02"],
         }
 
@@ -48,7 +60,6 @@ def test_convert_insert_needs_approval(monkeypatch):
     data = r.json()
 
     assert data["operation"] == "INSERT"
-    assert "INSERT INTO depense" in data["sql"]
-    assert data["needs_approval"] is True
-    assert data["risk_level"] == "high"
+    assert data["risk"]["needs_approval"] is True
+    assert data["risk"]["level"] == "high"
     assert "depense" in data["tables"]
