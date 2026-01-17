@@ -35,8 +35,9 @@ ENV = os.getenv("ENV", "dev")
 SCHEMA_REFRESH_SECONDS = int(os.getenv("SCHEMA_REFRESH_SECONDS", "0"))
 
 # If True: Text2SQL returns schema errors as notes (soft-fail) instead of HTTP 400.
-# Recommended for your architecture (guard decides final).
 TEXT2SQL_SOFT_SCHEMA_FAIL = os.getenv("TEXT2SQL_SOFT_SCHEMA_FAIL", "1") == "1"
+TEXT2SQL_STUB_LLM = os.getenv("TEXT2SQL_STUB_LLM", "0") == "1"
+
 
 
 # =========================================================

@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg2
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 import sqlglot
 from sqlglot import exp
@@ -18,7 +18,7 @@ from sqlglot import exp
 POSTGRES_DB = os.getenv("POSTGRES_DB", "orionis")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "orionis")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "orionis")
-POSTGRES_HOST = os.getenv("POSTGRES_HOST", "orionis-postgres")
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 
 ENV = os.getenv("ENV", "dev")
@@ -32,19 +32,16 @@ GUARD_MAX_ROWS = int(os.getenv("GUARD_MAX_ROWS", "200"))
 # Schema refresh
 SCHEMA_REFRESH_SECONDS = int(os.getenv("SCHEMA_REFRESH_SECONDS", "60"))
 
-
-# FinanceAdmin: all
-# ProjectManager: SELECT + INSERT + UPDATE (no DELETE)
-# ReadOnly: SELECT only
+# Basic RBAC (can evolve later)
 ROLE_POLICIES: Dict[str, Dict[str, Any]] = {
     "FinanceAdmin": {"ops": {"SELECT", "INSERT", "UPDATE", "DELETE"}},
-    "ProjectManager": {"ops": {"SELECT", "INSERT", "UPDATE"}},
+    "ProjectManager": {"ops": {"SELECT", "INSERT", "UPDATE"}},  # no DELETE
     "ReadOnly": {"ops": {"SELECT"}},
 }
 
 
 # =========================================================
-# Models
+# Models (SQLPlan contract)
 # =========================================================
 class RiskInfo(BaseModel):
     level: str
@@ -150,7 +147,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="SQL Guard Service", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="SQL Guard Service", version="1.1.0", lifespan=lifespan)
 
 
 # =========================================================
@@ -176,13 +173,13 @@ def seems_multi_statement(sql: str) -> bool:
     if not sql:
         return False
     stripped = sql.strip()
+    # allow trailing semicolon only
     if stripped.endswith(";"):
         stripped = stripped[:-1]
     return bool(_MULTI_STATEMENT.search(stripped))
 
 
 def parse_sql_ast_strict(sql: str) -> exp.Expression:
-    # strict parse (postgres dialect)
     return sqlglot.parse_one(sql, read="postgres")
 
 
@@ -214,17 +211,18 @@ def extract_columns_ast(node: exp.Expression) -> List[Tuple[Optional[str], str]]
 
 
 def has_where_clause(node: exp.Expression) -> bool:
-    # For Update/Delete: sqlglot uses exp.Where under node
     return node.args.get("where") is not None
 
 
 def select_has_limit(node: exp.Expression) -> bool:
-    if isinstance(node, exp.Select):
-        return node.args.get("limit") is not None
-    return False
+    return isinstance(node, exp.Select) and node.args.get("limit") is not None
 
 
 def add_limit_to_select(node: exp.Expression, limit_n: int) -> exp.Expression:
+    """
+    Correct sqlglot LIMIT insertion:
+    SELECT ... -> SELECT ... LIMIT <n>
+    """
     if not isinstance(node, exp.Select):
         return node
     if node.args.get("limit") is None:
@@ -234,42 +232,75 @@ def add_limit_to_select(node: exp.Expression, limit_n: int) -> exp.Expression:
 
 def rbac_allows(role: Optional[str], operation: str) -> bool:
     if not role:
-        # no role => safest: only SELECT
         return operation == "SELECT"
     pol = ROLE_POLICIES.get(role)
     if not pol:
-        # unknown role => safest: only SELECT
         return operation == "SELECT"
     return operation in pol["ops"]
+
+
+def build_alias_map(node: exp.Expression) -> Dict[str, str]:
+    """
+    Map alias -> real table name based on FROM/JOIN clauses.
+    Example: FROM depense d JOIN projet p ... => {"d": "depense", "p": "projet"}
+    """
+    alias_map: Dict[str, str] = {}
+
+    for t in node.find_all(exp.Table):
+        table_name = t.name
+        alias = None
+        # sqlglot stores alias under t.args["alias"] as exp.TableAlias
+        if t.args.get("alias") and isinstance(t.args["alias"], exp.TableAlias):
+            alias = t.args["alias"].name
+        if table_name and alias:
+            alias_map[alias] = table_name
+
+    return alias_map
+
+
+def resolve_table_name(tbl: Optional[str], alias_map: Dict[str, str]) -> Optional[str]:
+    if not tbl:
+        return None
+    return alias_map.get(tbl, tbl)  # alias -> table, else keep
 
 
 def schema_allowlist_check(node: exp.Expression, schema: Dict[str, Any]) -> List[str]:
     """
     Strict allowlist:
     - All referenced tables must exist
-    - Qualified columns must exist
+    - Qualified columns must exist (table may be alias; we resolve alias -> table)
     - Unqualified columns are not validated here (can be ambiguous)
     """
     reasons: List[str] = []
-    tables = extract_tables_ast(node)
 
+    tables = extract_tables_ast(node)
     for t in tables:
         if t not in schema:
             reasons.append(f"Table interdite/inconnue: {t}")
 
     schema_cols = {t: set(schema[t]["columns"]) for t in schema}
+    alias_map = build_alias_map(node)
 
     for tbl, col in extract_columns_ast(node):
         if col == "*":
             continue
-        if tbl:
-            if tbl not in schema_cols:
-                reasons.append(f"Table interdite/inconnue (col check): {tbl}")
+
+        real_tbl = resolve_table_name(tbl, alias_map)
+
+        if real_tbl:
+            if real_tbl not in schema_cols:
+                reasons.append(f"Table interdite/inconnue (col check): {real_tbl}")
             else:
-                if col not in schema_cols[tbl]:
-                    reasons.append(f"Colonne interdite/inconnue: {tbl}.{col}")
+                if col not in schema_cols[real_tbl]:
+                    reasons.append(f"Colonne interdite/inconnue: {real_tbl}.{col}")
 
     return reasons
+
+def append_limit_sql(sql: str, limit_n: int) -> str:
+    s = sql.strip()
+    if s.endswith(";"):
+        s = s[:-1].strip()
+    return f"{s} LIMIT {limit_n}"
 
 
 # =========================================================
@@ -314,13 +345,13 @@ def check(plan: SQLPlan):
         reasons.append("Multi-statements détectés (interdit).")
 
     # Parse strict AST
-    node = None
+    node: Optional[exp.Expression] = None
     try:
         node = parse_sql_ast_strict(sql)
     except Exception as e:
         reasons.append(f"Parse AST strict échoué: {e}")
 
-    # If parse ok: determine operation from AST
+    # Determine operation/tables from AST if possible
     op = plan.operation or "UNKNOWN"
     tables: List[str] = plan.tables or []
     if node is not None:
@@ -351,22 +382,17 @@ def check(plan: SQLPlan):
     if node is not None and op == "SELECT":
         if not select_has_limit(node):
             if GUARD_AUTO_LIMIT:
-                node = add_limit_to_select(node, GUARD_MAX_ROWS)
-                normalized_sql = node.sql(dialect="postgres")
-                # keep risk low, but add note
+                normalized_sql = append_limit_sql(sql, GUARD_MAX_ROWS)
             else:
                 reasons.append("SELECT sans LIMIT (interdit).")
 
-    # Decide
     allowed = len(reasons) == 0
 
-    # If not allowed -> enforce risk_override high + approval
     if not allowed:
         risk_override = RiskInfo(level="high", needs_approval=True)
 
-    # If allowed but we normalized sql -> return normalized_sql
     if allowed and normalized_sql is None:
-        normalized_sql = sql  # stable echo
+        normalized_sql = sql
 
     return GuardResponse(
         allowed=allowed,

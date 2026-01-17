@@ -34,7 +34,7 @@ services:
       - postgres
       - text2sql
       - sql-guard
-      # - sql-executor
+      - sql-executor
       # - audit
 
   # =========================
@@ -82,17 +82,24 @@ services:
     depends_on:
       - postgres
 
-  # # =========================
-  # # SQL Executor (ONLY DB ACCESS)
-  # # =========================
-  # sql-executor:
-  #   build: ./services/sql-executor
-  #   container_name: sql-executor
-  #   restart: always
-  #   env_file:
-  #     - .env
-  #   depends_on:
-  #     - postgres
+  # =========================
+  # SQL Executor (ONLY DB ACCESS)
+  # =========================
+  sql-executor:
+    build: ./services/sql-executor
+    container_name: sql-executor
+    restart: always
+    env_file:
+      - .env
+    environment:
+      SQL_GUARD_URL: "http://sql-guard:8000"
+      DB_STATEMENT_TIMEOUT_MS: "5000"
+      MAX_RETURN_ROWS: "200"
+    ports:
+      - "8003:8000"
+    depends_on:
+      - postgres
+      - sql-guard
 
   # # =========================
   # # Audit Service

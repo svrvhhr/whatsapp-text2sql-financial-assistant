@@ -1,0 +1,12 @@
+{
+  "request_id":"manual-insert-readonly",
+  "user_input":"Ajout dépense",
+  "operation":"INSERT",
+  "sql":"INSERT INTO depense(projet_id, montant) VALUES (%s, %s);",
+  "params":[1,100],
+  "tables":["depense"],
+  "risk":{"level":"high","needs_approval":true},
+  "static_checks":{"ast_parsed":true,"ddl_blocked":true,"schema_ok":true,"single_statement":true},
+  "context":{"role":"ReadOnly"},
+  "notes":[]
+}

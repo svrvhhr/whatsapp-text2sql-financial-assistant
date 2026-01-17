@@ -1,0 +1,12 @@
+{
+  "request_id":"manual-ddl",
+  "user_input":"hack",
+  "operation":"UNKNOWN",
+  "sql":"DROP TABLE depense;",
+  "params":[],
+  "tables":[],
+  "risk":{"level":"high","needs_approval":true},
+  "static_checks":{"ast_parsed":false,"ddl_blocked":true,"schema_ok":true,"single_statement":true},
+  "context":{"role":"FinanceAdmin"},
+  "notes":[]
+}

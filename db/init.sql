@@ -29,10 +29,12 @@ ALTER TABLE IF EXISTS ONLY public.depense DROP CONSTRAINT IF EXISTS depense_proj
 ALTER TABLE IF EXISTS ONLY public.depense DROP CONSTRAINT IF EXISTS depense_compte_id_fkey;
 ALTER TABLE IF EXISTS ONLY public.compte_financier DROP CONSTRAINT IF EXISTS compte_financier_entreprise_id_fkey;
 ALTER TABLE IF EXISTS ONLY public.bureau DROP CONSTRAINT IF EXISTS bureau_entreprise_id_fkey;
-ALTER TABLE IF EXISTS ONLY public.audit_log DROP CONSTRAINT IF EXISTS audit_log_utilisateur_id_fkey;
+
 DROP TRIGGER IF EXISTS trg_update_solde ON public.depense;
 DROP TRIGGER IF EXISTS trg_check_solde ON public.depense;
+DROP TRIGGER IF EXISTS trg_check_budget ON public.depense;
 DROP TRIGGER IF EXISTS trg_audit_depense ON public.depense;
+
 ALTER TABLE IF EXISTS ONLY public.utilisateurs DROP CONSTRAINT IF EXISTS utilisateurs_whatsapp_number_key;
 ALTER TABLE IF EXISTS ONLY public.utilisateurs DROP CONSTRAINT IF EXISTS utilisateurs_pkey;
 ALTER TABLE IF EXISTS ONLY public.utilisateur DROP CONSTRAINT IF EXISTS utilisateur_pkey;
@@ -47,7 +49,8 @@ ALTER TABLE IF EXISTS ONLY public.depense DROP CONSTRAINT IF EXISTS depense_pkey
 ALTER TABLE IF EXISTS ONLY public.compte_financier DROP CONSTRAINT IF EXISTS compte_financier_pkey;
 ALTER TABLE IF EXISTS ONLY public.client DROP CONSTRAINT IF EXISTS client_pkey;
 ALTER TABLE IF EXISTS ONLY public.bureau DROP CONSTRAINT IF EXISTS bureau_pkey;
-ALTER TABLE IF EXISTS ONLY public.audit_log DROP CONSTRAINT IF EXISTS audit_log_pkey;
+ALTER TABLE IF EXISTS ONLY public.audit_event DROP CONSTRAINT IF EXISTS audit_event_pkey;
+
 ALTER TABLE IF EXISTS public.utilisateurs ALTER COLUMN id DROP DEFAULT;
 ALTER TABLE IF EXISTS public.utilisateur ALTER COLUMN id DROP DEFAULT;
 ALTER TABLE IF EXISTS public.transfert_interne ALTER COLUMN id DROP DEFAULT;
@@ -59,68 +62,122 @@ ALTER TABLE IF EXISTS public.depense ALTER COLUMN id DROP DEFAULT;
 ALTER TABLE IF EXISTS public.compte_financier ALTER COLUMN id DROP DEFAULT;
 ALTER TABLE IF EXISTS public.client ALTER COLUMN id DROP DEFAULT;
 ALTER TABLE IF EXISTS public.bureau ALTER COLUMN id DROP DEFAULT;
-ALTER TABLE IF EXISTS public.audit_log ALTER COLUMN id DROP DEFAULT;
+ALTER TABLE IF EXISTS public.audit_event ALTER COLUMN id DROP DEFAULT;
+
 DROP VIEW IF EXISTS public.vue_soldes_comptes;
 DROP VIEW IF EXISTS public.vue_factures_statut;
 DROP VIEW IF EXISTS public.vue_depenses_par_projet;
+
 DROP SEQUENCE IF EXISTS public.utilisateurs_id_seq;
 DROP TABLE IF EXISTS public.utilisateurs;
+
 DROP SEQUENCE IF EXISTS public.utilisateur_id_seq;
 DROP TABLE IF EXISTS public.utilisateur;
+
 DROP SEQUENCE IF EXISTS public.transfert_interne_id_seq;
 DROP TABLE IF EXISTS public.transfert_interne;
+
 DROP SEQUENCE IF EXISTS public.role_id_seq;
 DROP TABLE IF EXISTS public.role;
+
 DROP SEQUENCE IF EXISTS public.projet_id_seq;
 DROP TABLE IF EXISTS public.projet;
+
 DROP SEQUENCE IF EXISTS public.facture_id_seq;
 DROP TABLE IF EXISTS public.facture;
+
 DROP SEQUENCE IF EXISTS public.entreprise_id_seq;
 DROP TABLE IF EXISTS public.entreprise;
+
 DROP SEQUENCE IF EXISTS public.depense_id_seq;
 DROP TABLE IF EXISTS public.depense;
+
 DROP SEQUENCE IF EXISTS public.compte_financier_id_seq;
 DROP TABLE IF EXISTS public.compte_financier;
+
 DROP SEQUENCE IF EXISTS public.client_id_seq;
 DROP TABLE IF EXISTS public.client;
+
 DROP SEQUENCE IF EXISTS public.bureau_id_seq;
 DROP TABLE IF EXISTS public.bureau;
-DROP SEQUENCE IF EXISTS public.audit_log_id_seq;
-DROP TABLE IF EXISTS public.audit_log;
+
+DROP SEQUENCE IF EXISTS public.audit_event_id_seq;
+DROP TABLE IF EXISTS public.audit_event;
+
 DROP FUNCTION IF EXISTS public.update_solde_compte();
 DROP FUNCTION IF EXISTS public.payer_facture(p_facture_id integer);
 DROP FUNCTION IF EXISTS public.effectuer_transfert(p_source_id integer, p_destination_id integer, p_montant numeric, p_devise character varying);
 DROP FUNCTION IF EXISTS public.check_solde_compte();
 DROP FUNCTION IF EXISTS public.check_budget_projet();
-DROP FUNCTION IF EXISTS public.audit_action();
---
--- Name: audit_action(); Type: FUNCTION; Schema: public; Owner: postgres
---
+DROP FUNCTION IF EXISTS public.audit_event_trigger();
 
-CREATE FUNCTION public.audit_action() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
+
+-- =========================================================
+-- FUNCTIONS
+-- =========================================================
+
+-- 1) Audit trigger => writes into audit_event (official audit)
+CREATE FUNCTION public.audit_event_trigger() RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_request_id TEXT;
+  v_actor_id TEXT;
+  v_role TEXT;
+  v_entreprise_id INT;
+  v_projet_id INT;
+  v_entity_id TEXT;
 BEGIN
-    INSERT INTO audit_log (utilisateur_id, action)
-    VALUES (
-        NULL,
-        TG_OP || ' sur la table ' || TG_TABLE_NAME
-    );
+  v_request_id := current_setting('app.request_id', true);
+  v_actor_id := current_setting('app.actor_id', true);
+  v_role := current_setting('app.role', true);
 
-    RETURN NEW;
+  v_entreprise_id := NULLIF(current_setting('app.entreprise_id', true), '')::int;
+  v_projet_id := NULLIF(current_setting('app.projet_id', true), '')::int;
+
+  -- best-effort entity_id for tables that have "id"
+  BEGIN
+    IF (TG_OP = 'INSERT') THEN
+      v_entity_id := (NEW.id)::text;
+    ELSIF (TG_OP = 'UPDATE') THEN
+      v_entity_id := (NEW.id)::text;
+    ELSIF (TG_OP = 'DELETE') THEN
+      v_entity_id := (OLD.id)::text;
+    END IF;
+  EXCEPTION WHEN others THEN
+    v_entity_id := NULL;
+  END;
+
+  INSERT INTO audit_event(
+    request_id, actor_id, role, entreprise_id, projet_id,
+    operation, sql, params, status, reasons, duration_ms, row_count, affected_rows,
+    entity, entity_id
+  )
+  VALUES (
+    v_request_id, v_actor_id, v_role, v_entreprise_id, v_projet_id,
+    TG_OP,
+    'TRIGGER ' || TG_OP || ' ON ' || TG_TABLE_NAME,
+    NULL,
+    'db_trigger',
+    NULL,
+    NULL, NULL, NULL,
+    TG_TABLE_NAME, v_entity_id
+  );
+
+  IF (TG_OP = 'DELETE') THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
 END;
 $$;
 
+ALTER FUNCTION public.audit_event_trigger() OWNER TO orionis;
 
-ALTER FUNCTION public.audit_action() OWNER TO orionis;
 
---
--- Name: check_budget_projet(); Type: FUNCTION; Schema: public; Owner: postgres
---
-
+-- 2) Budget check (already existed in your dump, now kept)
 CREATE FUNCTION public.check_budget_projet() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
+LANGUAGE plpgsql
+AS $$
 DECLARE
     total_depenses NUMERIC;
     budget NUMERIC;
@@ -136,23 +193,20 @@ BEGIN
     WHERE id = NEW.projet_id;
 
     IF total_depenses + NEW.montant > budget THEN
-        RAISE EXCEPTION 'D├®passement du budget du projet %', NEW.projet_id;
+        RAISE EXCEPTION 'Depassement du budget du projet %', NEW.projet_id;
     END IF;
 
     RETURN NEW;
 END;
 $$;
 
-
 ALTER FUNCTION public.check_budget_projet() OWNER TO orionis;
 
---
--- Name: check_solde_compte(); Type: FUNCTION; Schema: public; Owner: postgres
---
 
+-- 3) Balance check (already existed)
 CREATE FUNCTION public.check_solde_compte() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
+LANGUAGE plpgsql
+AS $$
 DECLARE
     solde_actuel NUMERIC;
 BEGIN
@@ -169,21 +223,23 @@ BEGIN
 END;
 $$;
 
-
 ALTER FUNCTION public.check_solde_compte() OWNER TO orionis;
 
---
--- Name: effectuer_transfert(integer, integer, numeric, character varying); Type: FUNCTION; Schema: public; Owner: postgres
---
 
-CREATE FUNCTION public.effectuer_transfert(p_source_id integer, p_destination_id integer, p_montant numeric, p_devise character varying) RETURNS void
-    LANGUAGE plpgsql
-    AS $$
+-- 4) Transfer function (already existed)
+CREATE FUNCTION public.effectuer_transfert(
+  p_source_id integer,
+  p_destination_id integer,
+  p_montant numeric,
+  p_devise character varying
+) RETURNS void
+LANGUAGE plpgsql
+AS $$
 DECLARE
     solde_source NUMERIC;
 BEGIN
     IF p_source_id = p_destination_id THEN
-        RAISE EXCEPTION 'Les comptes source et destination doivent ├¬tre diff├®rents';
+        RAISE EXCEPTION 'Les comptes source et destination doivent etre differents';
     END IF;
 
     SELECT solde
@@ -220,16 +276,13 @@ BEGIN
 END;
 $$;
 
-
 ALTER FUNCTION public.effectuer_transfert(p_source_id integer, p_destination_id integer, p_montant numeric, p_devise character varying) OWNER TO orionis;
 
---
--- Name: payer_facture(integer); Type: FUNCTION; Schema: public; Owner: postgres
---
 
+-- 5) Pay invoice function (already existed)
 CREATE FUNCTION public.payer_facture(p_facture_id integer) RETURNS void
-    LANGUAGE plpgsql
-    AS $$
+LANGUAGE plpgsql
+AS $$
 BEGIN
     UPDATE facture
     SET statut = 'PAYEE',
@@ -238,21 +291,18 @@ BEGIN
       AND statut = 'EMISE';
 
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'Facture % introuvable ou d├®j├á pay├®e', p_facture_id;
+        RAISE EXCEPTION 'Facture % introuvable ou deja payee', p_facture_id;
     END IF;
 END;
 $$;
 
-
 ALTER FUNCTION public.payer_facture(p_facture_id integer) OWNER TO orionis;
 
---
--- Name: update_solde_compte(); Type: FUNCTION; Schema: public; Owner: postgres
---
 
+-- 6) Update balance AFTER insert expense (already existed)
 CREATE FUNCTION public.update_solde_compte() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
+LANGUAGE plpgsql
+AS $$
 BEGIN
     UPDATE compte_financier
     SET solde = solde - NEW.montant
@@ -262,32 +312,37 @@ BEGIN
 END;
 $$;
 
-
 ALTER FUNCTION public.update_solde_compte() OWNER TO orionis;
 
-SET default_tablespace = '';
 
-SET default_table_access_method = heap;
+-- =========================================================
+-- TABLES + SEQUENCES
+-- =========================================================
 
---
--- Name: audit_log; Type: TABLE; Schema: public; Owner: postgres
---
-
-CREATE TABLE public.audit_log (
+-- Official audit table
+CREATE TABLE public.audit_event (
     id integer NOT NULL,
-    utilisateur_id integer,
-    action text NOT NULL,
-    date_action timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+    request_id text,
+    created_at timestamp with time zone DEFAULT now(),
+    actor_id text,
+    role text,
+    entreprise_id integer,
+    projet_id integer,
+    operation text,
+    sql text,
+    params jsonb,
+    status text,
+    reasons text,
+    duration_ms integer,
+    row_count integer,
+    affected_rows integer,
+    entity text,
+    entity_id text
 );
 
+ALTER TABLE public.audit_event OWNER TO orionis;
 
-ALTER TABLE public.audit_log OWNER TO orionis;
-
---
--- Name: audit_log_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
---
-
-CREATE SEQUENCE public.audit_log_id_seq
+CREATE SEQUENCE public.audit_event_id_seq
     AS integer
     START WITH 1
     INCREMENT BY 1
@@ -295,91 +350,35 @@ CREATE SEQUENCE public.audit_log_id_seq
     NO MAXVALUE
     CACHE 1;
 
+ALTER SEQUENCE public.audit_event_id_seq OWNER TO orionis;
+ALTER SEQUENCE public.audit_event_id_seq OWNED BY public.audit_event.id;
 
-ALTER SEQUENCE public.audit_log_id_seq OWNER TO orionis;
-
---
--- Name: audit_log_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
---
-
-ALTER SEQUENCE public.audit_log_id_seq OWNED BY public.audit_log.id;
-
-
---
--- Name: bureau; Type: TABLE; Schema: public; Owner: postgres
---
-
+-- Bureau
 CREATE TABLE public.bureau (
     id integer NOT NULL,
     entreprise_id integer NOT NULL,
     nom character varying(100),
     ville character varying(50)
 );
-
-
 ALTER TABLE public.bureau OWNER TO orionis;
 
---
--- Name: bureau_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
---
-
-CREATE SEQUENCE public.bureau_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
+CREATE SEQUENCE public.bureau_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
 ALTER SEQUENCE public.bureau_id_seq OWNER TO orionis;
-
---
--- Name: bureau_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
---
-
 ALTER SEQUENCE public.bureau_id_seq OWNED BY public.bureau.id;
 
-
---
--- Name: client; Type: TABLE; Schema: public; Owner: postgres
---
-
+-- Client
 CREATE TABLE public.client (
     id integer NOT NULL,
     nom character varying(100) NOT NULL,
     email character varying(100)
 );
-
-
 ALTER TABLE public.client OWNER TO orionis;
 
---
--- Name: client_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
---
-
-CREATE SEQUENCE public.client_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
+CREATE SEQUENCE public.client_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
 ALTER SEQUENCE public.client_id_seq OWNER TO orionis;
-
---
--- Name: client_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
---
-
 ALTER SEQUENCE public.client_id_seq OWNED BY public.client.id;
 
-
---
--- Name: compte_financier; Type: TABLE; Schema: public; Owner: postgres
---
-
+-- Compte financier
 CREATE TABLE public.compte_financier (
     id integer NOT NULL,
     entreprise_id integer NOT NULL,
@@ -388,36 +387,13 @@ CREATE TABLE public.compte_financier (
     solde numeric(14,2) DEFAULT 0,
     CONSTRAINT compte_financier_solde_check CHECK ((solde >= (0)::numeric))
 );
-
-
 ALTER TABLE public.compte_financier OWNER TO orionis;
 
---
--- Name: compte_financier_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
---
-
-CREATE SEQUENCE public.compte_financier_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
+CREATE SEQUENCE public.compte_financier_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
 ALTER SEQUENCE public.compte_financier_id_seq OWNER TO orionis;
-
---
--- Name: compte_financier_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
---
-
 ALTER SEQUENCE public.compte_financier_id_seq OWNED BY public.compte_financier.id;
 
-
---
--- Name: depense; Type: TABLE; Schema: public; Owner: postgres
---
-
+-- Depense
 CREATE TABLE public.depense (
     id integer NOT NULL,
     projet_id integer NOT NULL,
@@ -429,72 +405,26 @@ CREATE TABLE public.depense (
     date_depense date NOT NULL,
     CONSTRAINT depense_montant_check CHECK ((montant > (0)::numeric))
 );
-
-
 ALTER TABLE public.depense OWNER TO orionis;
 
---
--- Name: depense_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
---
-
-CREATE SEQUENCE public.depense_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
+CREATE SEQUENCE public.depense_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
 ALTER SEQUENCE public.depense_id_seq OWNER TO orionis;
-
---
--- Name: depense_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
---
-
 ALTER SEQUENCE public.depense_id_seq OWNED BY public.depense.id;
 
-
---
--- Name: entreprise; Type: TABLE; Schema: public; Owner: postgres
---
-
+-- Entreprise
 CREATE TABLE public.entreprise (
     id integer NOT NULL,
     nom character varying(100) NOT NULL,
     pays character varying(50),
     devise_principale character varying(10) NOT NULL
 );
-
-
 ALTER TABLE public.entreprise OWNER TO orionis;
 
---
--- Name: entreprise_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
---
-
-CREATE SEQUENCE public.entreprise_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
+CREATE SEQUENCE public.entreprise_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
 ALTER SEQUENCE public.entreprise_id_seq OWNER TO orionis;
-
---
--- Name: entreprise_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
---
-
 ALTER SEQUENCE public.entreprise_id_seq OWNED BY public.entreprise.id;
 
-
---
--- Name: facture; Type: TABLE; Schema: public; Owner: postgres
---
-
+-- Facture
 CREATE TABLE public.facture (
     id integer NOT NULL,
     projet_id integer NOT NULL,
@@ -506,36 +436,13 @@ CREATE TABLE public.facture (
     date_paiement date,
     CONSTRAINT facture_statut_check CHECK (((statut)::text = ANY ((ARRAY['EMISE'::character varying, 'PAYEE'::character varying])::text[])))
 );
-
-
 ALTER TABLE public.facture OWNER TO orionis;
 
---
--- Name: facture_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
---
-
-CREATE SEQUENCE public.facture_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
+CREATE SEQUENCE public.facture_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
 ALTER SEQUENCE public.facture_id_seq OWNER TO orionis;
-
---
--- Name: facture_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
---
-
 ALTER SEQUENCE public.facture_id_seq OWNED BY public.facture.id;
 
-
---
--- Name: projet; Type: TABLE; Schema: public; Owner: postgres
---
-
+-- Projet
 CREATE TABLE public.projet (
     id integer NOT NULL,
     entreprise_id integer NOT NULL,
@@ -544,70 +451,24 @@ CREATE TABLE public.projet (
     date_debut date,
     date_fin date
 );
-
-
 ALTER TABLE public.projet OWNER TO orionis;
 
---
--- Name: projet_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
---
-
-CREATE SEQUENCE public.projet_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
+CREATE SEQUENCE public.projet_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
 ALTER SEQUENCE public.projet_id_seq OWNER TO orionis;
-
---
--- Name: projet_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
---
-
 ALTER SEQUENCE public.projet_id_seq OWNED BY public.projet.id;
 
-
---
--- Name: role; Type: TABLE; Schema: public; Owner: postgres
---
-
+-- Role
 CREATE TABLE public.role (
     id integer NOT NULL,
     nom character varying(50) NOT NULL
 );
-
-
 ALTER TABLE public.role OWNER TO orionis;
 
---
--- Name: role_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
---
-
-CREATE SEQUENCE public.role_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
+CREATE SEQUENCE public.role_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
 ALTER SEQUENCE public.role_id_seq OWNER TO orionis;
-
---
--- Name: role_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
---
-
 ALTER SEQUENCE public.role_id_seq OWNED BY public.role.id;
 
-
---
--- Name: transfert_interne; Type: TABLE; Schema: public; Owner: postgres
---
-
+-- Transfert interne
 CREATE TABLE public.transfert_interne (
     id integer NOT NULL,
     compte_source_id integer NOT NULL,
@@ -618,72 +479,26 @@ CREATE TABLE public.transfert_interne (
     CONSTRAINT transfert_interne_check CHECK ((compte_source_id <> compte_destination_id)),
     CONSTRAINT transfert_interne_montant_check CHECK ((montant > (0)::numeric))
 );
-
-
 ALTER TABLE public.transfert_interne OWNER TO orionis;
 
---
--- Name: transfert_interne_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
---
-
-CREATE SEQUENCE public.transfert_interne_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
+CREATE SEQUENCE public.transfert_interne_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
 ALTER SEQUENCE public.transfert_interne_id_seq OWNER TO orionis;
-
---
--- Name: transfert_interne_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
---
-
 ALTER SEQUENCE public.transfert_interne_id_seq OWNED BY public.transfert_interne.id;
 
-
---
--- Name: utilisateur; Type: TABLE; Schema: public; Owner: postgres
---
-
+-- Utilisateur (table "utilisateur" avec role_id)
 CREATE TABLE public.utilisateur (
     id integer NOT NULL,
     nom character varying(100),
     numero_whatsapp character varying(20) NOT NULL,
     role_id integer
 );
-
-
 ALTER TABLE public.utilisateur OWNER TO orionis;
 
---
--- Name: utilisateur_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
---
-
-CREATE SEQUENCE public.utilisateur_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
+CREATE SEQUENCE public.utilisateur_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
 ALTER SEQUENCE public.utilisateur_id_seq OWNER TO orionis;
-
---
--- Name: utilisateur_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
---
-
 ALTER SEQUENCE public.utilisateur_id_seq OWNED BY public.utilisateur.id;
 
-
---
--- Name: utilisateurs; Type: TABLE; Schema: public; Owner: postgres
---
-
+-- Utilisateurs (table legacy alternative)
 CREATE TABLE public.utilisateurs (
     id integer NOT NULL,
     nom character varying(100) NOT NULL,
@@ -691,182 +506,79 @@ CREATE TABLE public.utilisateurs (
     role character varying(50) NOT NULL,
     CONSTRAINT utilisateurs_role_check CHECK (((role)::text = ANY ((ARRAY['admin_financier'::character varying, 'responsable_projet'::character varying, 'lecture_seule'::character varying])::text[])))
 );
-
-
 ALTER TABLE public.utilisateurs OWNER TO orionis;
 
---
--- Name: utilisateurs_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
---
-
-CREATE SEQUENCE public.utilisateurs_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
+CREATE SEQUENCE public.utilisateurs_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
 ALTER SEQUENCE public.utilisateurs_id_seq OWNER TO orionis;
-
---
--- Name: utilisateurs_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
---
-
 ALTER SEQUENCE public.utilisateurs_id_seq OWNED BY public.utilisateurs.id;
 
 
---
--- Name: vue_depenses_par_projet; Type: VIEW; Schema: public; Owner: postgres
---
-
+-- =========================================================
+-- VIEWS
+-- =========================================================
 CREATE VIEW public.vue_depenses_par_projet AS
- SELECT p.id AS projet_id,
-    p.nom AS projet,
-    sum(d.montant) AS total_depenses
-   FROM (public.projet p
-     LEFT JOIN public.depense d ON ((p.id = d.projet_id)))
-  GROUP BY p.id, p.nom;
-
+SELECT
+  p.id AS projet_id,
+  p.nom AS projet,
+  SUM(d.montant) AS total_depenses
+FROM public.projet p
+LEFT JOIN public.depense d ON (p.id = d.projet_id)
+GROUP BY p.id, p.nom;
 
 ALTER VIEW public.vue_depenses_par_projet OWNER TO orionis;
 
---
--- Name: vue_factures_statut; Type: VIEW; Schema: public; Owner: postgres
---
-
 CREATE VIEW public.vue_factures_statut AS
- SELECT statut,
-    count(*) AS nombre_factures,
-    sum(montant) AS montant_total
-   FROM public.facture
-  GROUP BY statut;
-
+SELECT
+  statut,
+  COUNT(*) AS nombre_factures,
+  SUM(montant) AS montant_total
+FROM public.facture
+GROUP BY statut;
 
 ALTER VIEW public.vue_factures_statut OWNER TO orionis;
 
---
--- Name: vue_soldes_comptes; Type: VIEW; Schema: public; Owner: postgres
---
-
 CREATE VIEW public.vue_soldes_comptes AS
- SELECT id AS compte_id,
-    nom,
-    devise,
-    solde
-   FROM public.compte_financier;
-
+SELECT
+  id AS compte_id,
+  nom,
+  devise,
+  solde
+FROM public.compte_financier;
 
 ALTER VIEW public.vue_soldes_comptes OWNER TO orionis;
 
---
--- Name: audit_log id; Type: DEFAULT; Schema: public; Owner: postgres
---
 
-ALTER TABLE ONLY public.audit_log ALTER COLUMN id SET DEFAULT nextval('public.audit_log_id_seq'::regclass);
-
-
---
--- Name: bureau id; Type: DEFAULT; Schema: public; Owner: postgres
---
-
+-- =========================================================
+-- DEFAULTS (serial)
+-- =========================================================
+ALTER TABLE ONLY public.audit_event ALTER COLUMN id SET DEFAULT nextval('public.audit_event_id_seq'::regclass);
 ALTER TABLE ONLY public.bureau ALTER COLUMN id SET DEFAULT nextval('public.bureau_id_seq'::regclass);
-
-
---
--- Name: client id; Type: DEFAULT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.client ALTER COLUMN id SET DEFAULT nextval('public.client_id_seq'::regclass);
-
-
---
--- Name: compte_financier id; Type: DEFAULT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.compte_financier ALTER COLUMN id SET DEFAULT nextval('public.compte_financier_id_seq'::regclass);
-
-
---
--- Name: depense id; Type: DEFAULT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.depense ALTER COLUMN id SET DEFAULT nextval('public.depense_id_seq'::regclass);
-
-
---
--- Name: entreprise id; Type: DEFAULT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.entreprise ALTER COLUMN id SET DEFAULT nextval('public.entreprise_id_seq'::regclass);
-
-
---
--- Name: facture id; Type: DEFAULT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.facture ALTER COLUMN id SET DEFAULT nextval('public.facture_id_seq'::regclass);
-
-
---
--- Name: projet id; Type: DEFAULT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.projet ALTER COLUMN id SET DEFAULT nextval('public.projet_id_seq'::regclass);
-
-
---
--- Name: role id; Type: DEFAULT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.role ALTER COLUMN id SET DEFAULT nextval('public.role_id_seq'::regclass);
-
-
---
--- Name: transfert_interne id; Type: DEFAULT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.transfert_interne ALTER COLUMN id SET DEFAULT nextval('public.transfert_interne_id_seq'::regclass);
-
-
---
--- Name: utilisateur id; Type: DEFAULT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.utilisateur ALTER COLUMN id SET DEFAULT nextval('public.utilisateur_id_seq'::regclass);
-
-
---
--- Name: utilisateurs id; Type: DEFAULT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.utilisateurs ALTER COLUMN id SET DEFAULT nextval('public.utilisateurs_id_seq'::regclass);
 
 
---
--- Data for Name: audit_log; Type: TABLE DATA; Schema: public; Owner: postgres
---
+-- =========================================================
+-- DATA (seed)
+-- =========================================================
 
-COPY public.audit_log (id, utilisateur_id, action, date_action) FROM stdin;
-1	1	Initialisation de la base de donn├®es	2026-01-11 21:06:12.892437
+-- Audit init event (replaces old audit_log seed)
+COPY public.audit_event (id, request_id, created_at, actor_id, role, entreprise_id, projet_id, operation, sql, params, status, reasons, duration_ms, row_count, affected_rows, entity, entity_id) FROM stdin;
+1	\N	2026-01-11 21:06:12.892437+00	\N	\N	\N	\N	INIT	Initialisation de la base de donnees	\N	executed	\N	\N	\N	\N	system	\N
 \.
 
-
---
--- Data for Name: bureau; Type: TABLE DATA; Schema: public; Owner: postgres
---
-
 COPY public.bureau (id, entreprise_id, nom, ville) FROM stdin;
-1	1	Si├¿ge Paris	Paris
+1	1	Siege Paris	Paris
 2	1	Agence Lyon	Lyon
 3	2	Bureau Berlin	Berlin
 \.
-
-
---
--- Data for Name: client; Type: TABLE DATA; Schema: public; Owner: postgres
---
 
 COPY public.client (id, nom, email) FROM stdin;
 1	Client Alpha	contact@alpha.com
@@ -877,53 +589,16 @@ COPY public.client (id, nom, email) FROM stdin;
 6	Client Gamma	admin@gamma.com
 \.
 
-
---
--- Data for Name: compte_financier; Type: TABLE DATA; Schema: public; Owner: postgres
---
-
 COPY public.compte_financier (id, entreprise_id, nom, devise, solde) FROM stdin;
 3	2	Compte International	EUR	40000.00
 1	1	Compte Principal EUR	EUR	20000.00
 2	1	Compte Projets	EUR	17000.00
 \.
 
-
---
--- Data for Name: depense; Type: TABLE DATA; Schema: public; Owner: postgres
---
-
-COPY public.depense (id, projet_id, compte_id, type_depense, montant, devise, description, date_depense) FROM stdin;
-1	1	1	cloud	3000.00	EUR	Serveurs cloud AWS	2025-03-20
-2	1	1	freelance	2500.00	EUR	Consultant IA	2025-03-25
-3	2	2	logiciel	4000.00	EUR	Licences logicielles	2025-04-05
-\.
-
-
---
--- Data for Name: entreprise; Type: TABLE DATA; Schema: public; Owner: postgres
---
-
 COPY public.entreprise (id, nom, pays, devise_principale) FROM stdin;
 1	Orionis Group	France	EUR
 2	Orionis International	Germany	EUR
 \.
-
-
---
--- Data for Name: facture; Type: TABLE DATA; Schema: public; Owner: postgres
---
-
-COPY public.facture (id, projet_id, client_id, montant, devise, statut, date_emission, date_paiement) FROM stdin;
-1	1	1	5000.00	EUR	EMISE	2025-03-10	\N
-2	1	2	7200.00	EUR	EMISE	2025-03-15	\N
-3	2	3	6500.00	EUR	EMISE	2025-04-01	\N
-\.
-
-
---
--- Data for Name: projet; Type: TABLE DATA; Schema: public; Owner: postgres
---
 
 COPY public.projet (id, entreprise_id, nom, budget_total, date_debut, date_fin) FROM stdin;
 1	1	Projet IA Finance	20000.00	2025-01-01	2025-12-31
@@ -931,41 +606,17 @@ COPY public.projet (id, entreprise_id, nom, budget_total, date_debut, date_fin) 
 3	2	Analyse Data Europe	30000.00	2025-03-01	2025-11-30
 \.
 
-
---
--- Data for Name: role; Type: TABLE DATA; Schema: public; Owner: postgres
---
-
 COPY public.role (id, nom) FROM stdin;
 1	ADMIN
 2	FINANCE
 3	CONSULTATION
 \.
 
-
---
--- Data for Name: transfert_interne; Type: TABLE DATA; Schema: public; Owner: postgres
---
-
-COPY public.transfert_interne (id, compte_source_id, compte_destination_id, montant, devise, date_transfert) FROM stdin;
-1	1	2	5000.00	EUR	2026-01-11
-\.
-
-
---
--- Data for Name: utilisateur; Type: TABLE DATA; Schema: public; Owner: postgres
---
-
 COPY public.utilisateur (id, nom, numero_whatsapp, role_id) FROM stdin;
 1	Sarah Harrouche	+33600000001	1
 2	Lina Chetti	+33600000002	2
 3	Jennifer Said	+33600000003	3
 \.
-
-
---
--- Data for Name: utilisateurs; Type: TABLE DATA; Schema: public; Owner: postgres
---
 
 COPY public.utilisateurs (id, nom, whatsapp_number, role) FROM stdin;
 1	Alice Admin	+33123456789	admin_financier
@@ -975,323 +626,155 @@ COPY public.utilisateurs (id, nom, whatsapp_number, role) FROM stdin;
 5	Eve Admin2	+33555443322	admin_financier
 \.
 
+COPY public.transfert_interne (id, compte_source_id, compte_destination_id, montant, devise, date_transfert) FROM stdin;
+1	1	2	5000.00	EUR	2026-01-11
+\.
 
---
--- Name: audit_log_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
---
+COPY public.facture (id, projet_id, client_id, montant, devise, statut, date_emission, date_paiement) FROM stdin;
+1	1	1	5000.00	EUR	EMISE	2025-03-10	\N
+2	1	2	7200.00	EUR	EMISE	2025-03-15	\N
+3	2	3	6500.00	EUR	EMISE	2025-04-01	\N
+\.
 
-SELECT pg_catalog.setval('public.audit_log_id_seq', 1, true);
+COPY public.depense (id, projet_id, compte_id, type_depense, montant, devise, description, date_depense) FROM stdin;
+1	1	1	cloud	3000.00	EUR	Serveurs cloud AWS	2025-03-20
+2	1	1	freelance	2500.00	EUR	Consultant IA	2025-03-25
+3	2	2	logiciel	4000.00	EUR	Licences logicielles	2025-04-05
+\.
 
 
---
--- Name: bureau_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
---
-
+-- Sequence values
+SELECT pg_catalog.setval('public.audit_event_id_seq', 1, true);
 SELECT pg_catalog.setval('public.bureau_id_seq', 3, true);
-
-
---
--- Name: client_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
---
-
 SELECT pg_catalog.setval('public.client_id_seq', 6, true);
-
-
---
--- Name: compte_financier_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
---
-
 SELECT pg_catalog.setval('public.compte_financier_id_seq', 3, true);
-
-
---
--- Name: depense_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
---
-
 SELECT pg_catalog.setval('public.depense_id_seq', 4, true);
-
-
---
--- Name: entreprise_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
---
-
 SELECT pg_catalog.setval('public.entreprise_id_seq', 2, true);
-
-
---
--- Name: facture_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
---
-
 SELECT pg_catalog.setval('public.facture_id_seq', 3, true);
-
-
---
--- Name: projet_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
---
-
 SELECT pg_catalog.setval('public.projet_id_seq', 3, true);
-
-
---
--- Name: role_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
---
-
 SELECT pg_catalog.setval('public.role_id_seq', 3, true);
-
-
---
--- Name: transfert_interne_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
---
-
 SELECT pg_catalog.setval('public.transfert_interne_id_seq', 1, true);
-
-
---
--- Name: utilisateur_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
---
-
 SELECT pg_catalog.setval('public.utilisateur_id_seq', 3, true);
-
-
---
--- Name: utilisateurs_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
---
-
 SELECT pg_catalog.setval('public.utilisateurs_id_seq', 5, true);
 
 
---
--- Name: audit_log audit_log_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
---
+-- =========================================================
+-- CONSTRAINTS
+-- =========================================================
 
-ALTER TABLE ONLY public.audit_log
-    ADD CONSTRAINT audit_log_pkey PRIMARY KEY (id);
-
-
---
--- Name: bureau bureau_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
---
+ALTER TABLE ONLY public.audit_event
+    ADD CONSTRAINT audit_event_pkey PRIMARY KEY (id);
 
 ALTER TABLE ONLY public.bureau
     ADD CONSTRAINT bureau_pkey PRIMARY KEY (id);
 
-
---
--- Name: client client_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.client
     ADD CONSTRAINT client_pkey PRIMARY KEY (id);
-
-
---
--- Name: compte_financier compte_financier_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
---
 
 ALTER TABLE ONLY public.compte_financier
     ADD CONSTRAINT compte_financier_pkey PRIMARY KEY (id);
 
-
---
--- Name: depense depense_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.depense
     ADD CONSTRAINT depense_pkey PRIMARY KEY (id);
-
-
---
--- Name: entreprise entreprise_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
---
 
 ALTER TABLE ONLY public.entreprise
     ADD CONSTRAINT entreprise_pkey PRIMARY KEY (id);
 
-
---
--- Name: facture facture_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.facture
     ADD CONSTRAINT facture_pkey PRIMARY KEY (id);
-
-
---
--- Name: projet projet_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
---
 
 ALTER TABLE ONLY public.projet
     ADD CONSTRAINT projet_pkey PRIMARY KEY (id);
 
-
---
--- Name: role role_nom_key; Type: CONSTRAINT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.role
     ADD CONSTRAINT role_nom_key UNIQUE (nom);
-
-
---
--- Name: role role_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
---
 
 ALTER TABLE ONLY public.role
     ADD CONSTRAINT role_pkey PRIMARY KEY (id);
 
-
---
--- Name: transfert_interne transfert_interne_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.transfert_interne
     ADD CONSTRAINT transfert_interne_pkey PRIMARY KEY (id);
-
-
---
--- Name: utilisateur utilisateur_numero_whatsapp_key; Type: CONSTRAINT; Schema: public; Owner: postgres
---
 
 ALTER TABLE ONLY public.utilisateur
     ADD CONSTRAINT utilisateur_numero_whatsapp_key UNIQUE (numero_whatsapp);
 
-
---
--- Name: utilisateur utilisateur_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.utilisateur
     ADD CONSTRAINT utilisateur_pkey PRIMARY KEY (id);
 
-
---
--- Name: utilisateurs utilisateurs_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.utilisateurs
     ADD CONSTRAINT utilisateurs_pkey PRIMARY KEY (id);
-
-
---
--- Name: utilisateurs utilisateurs_whatsapp_number_key; Type: CONSTRAINT; Schema: public; Owner: postgres
---
 
 ALTER TABLE ONLY public.utilisateurs
     ADD CONSTRAINT utilisateurs_whatsapp_number_key UNIQUE (whatsapp_number);
 
 
---
--- Name: depense trg_audit_depense; Type: TRIGGER; Schema: public; Owner: postgres
---
+-- =========================================================
+-- TRIGGERS (IMPORTANT)
+-- =========================================================
 
-CREATE TRIGGER trg_audit_depense AFTER INSERT ON public.depense FOR EACH ROW EXECUTE FUNCTION public.audit_action();
+-- audit on depense => into audit_event
+CREATE TRIGGER trg_audit_depense
+AFTER INSERT OR UPDATE OR DELETE ON public.depense
+FOR EACH ROW EXECUTE FUNCTION public.audit_event_trigger();
 
+-- enforce sufficient balance
+CREATE TRIGGER trg_check_solde
+BEFORE INSERT ON public.depense
+FOR EACH ROW EXECUTE FUNCTION public.check_solde_compte();
 
---
--- Name: depense trg_check_solde; Type: TRIGGER; Schema: public; Owner: postgres
---
+-- enforce project budget (THIS WAS MISSING IN YOUR ORIGINAL INIT)
+CREATE TRIGGER trg_check_budget
+BEFORE INSERT ON public.depense
+FOR EACH ROW EXECUTE FUNCTION public.check_budget_projet();
 
-CREATE TRIGGER trg_check_solde BEFORE INSERT ON public.depense FOR EACH ROW EXECUTE FUNCTION public.check_solde_compte();
-
-
---
--- Name: depense trg_update_solde; Type: TRIGGER; Schema: public; Owner: postgres
---
-
-CREATE TRIGGER trg_update_solde AFTER INSERT ON public.depense FOR EACH ROW EXECUTE FUNCTION public.update_solde_compte();
-
-
---
--- Name: audit_log audit_log_utilisateur_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
---
-
-ALTER TABLE ONLY public.audit_log
-    ADD CONSTRAINT audit_log_utilisateur_id_fkey FOREIGN KEY (utilisateur_id) REFERENCES public.utilisateur(id);
+-- update balance after insert
+CREATE TRIGGER trg_update_solde
+AFTER INSERT ON public.depense
+FOR EACH ROW EXECUTE FUNCTION public.update_solde_compte();
 
 
---
--- Name: bureau bureau_entreprise_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
---
+-- =========================================================
+-- FOREIGN KEYS
+-- =========================================================
 
 ALTER TABLE ONLY public.bureau
     ADD CONSTRAINT bureau_entreprise_id_fkey FOREIGN KEY (entreprise_id) REFERENCES public.entreprise(id);
 
-
---
--- Name: compte_financier compte_financier_entreprise_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.compte_financier
     ADD CONSTRAINT compte_financier_entreprise_id_fkey FOREIGN KEY (entreprise_id) REFERENCES public.entreprise(id);
-
-
---
--- Name: depense depense_compte_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
---
 
 ALTER TABLE ONLY public.depense
     ADD CONSTRAINT depense_compte_id_fkey FOREIGN KEY (compte_id) REFERENCES public.compte_financier(id);
 
-
---
--- Name: depense depense_projet_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.depense
     ADD CONSTRAINT depense_projet_id_fkey FOREIGN KEY (projet_id) REFERENCES public.projet(id);
-
-
---
--- Name: facture facture_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
---
 
 ALTER TABLE ONLY public.facture
     ADD CONSTRAINT facture_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.client(id);
 
-
---
--- Name: facture facture_projet_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.facture
     ADD CONSTRAINT facture_projet_id_fkey FOREIGN KEY (projet_id) REFERENCES public.projet(id);
-
-
---
--- Name: projet projet_entreprise_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
---
 
 ALTER TABLE ONLY public.projet
     ADD CONSTRAINT projet_entreprise_id_fkey FOREIGN KEY (entreprise_id) REFERENCES public.entreprise(id);
 
-
---
--- Name: transfert_interne transfert_interne_compte_destination_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.transfert_interne
     ADD CONSTRAINT transfert_interne_compte_destination_id_fkey FOREIGN KEY (compte_destination_id) REFERENCES public.compte_financier(id);
 
-
---
--- Name: transfert_interne transfert_interne_compte_source_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
---
-
 ALTER TABLE ONLY public.transfert_interne
     ADD CONSTRAINT transfert_interne_compte_source_id_fkey FOREIGN KEY (compte_source_id) REFERENCES public.compte_financier(id);
-
-
---
--- Name: utilisateur utilisateur_role_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
---
 
 ALTER TABLE ONLY public.utilisateur
     ADD CONSTRAINT utilisateur_role_id_fkey FOREIGN KEY (role_id) REFERENCES public.role(id);
 
 
---
--- PostgreSQL database dump complete
---
+-- =========================================================
+-- INDEXES (audit_event)
+-- =========================================================
+CREATE INDEX IF NOT EXISTS idx_audit_event_created_at ON public.audit_event(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_event_request_id ON public.audit_event(request_id);
+CREATE INDEX IF NOT EXISTS idx_audit_event_status ON public.audit_event(status);
+CREATE INDEX IF NOT EXISTS idx_audit_event_entity ON public.audit_event(entity);
 
-\unrestrict vgIDoYedc1envmdbaz4MOy14wvfwGbXHaC7Ajw7bHuWI1AVIPBNFnjKlRP3mYnf
 
+-- Done

@@ -1,0 +1,12 @@
+{
+  "request_id":"slow-1",
+  "user_input":"slow",
+  "operation":"SELECT",
+  "sql":"SELECT pg_sleep(10);",
+  "params":[],
+  "tables":[],
+  "risk":{"level":"low","needs_approval":false},
+  "static_checks":{"ast_parsed":true,"ddl_blocked":true,"schema_ok":true,"single_statement":true},
+  "context":{"role":"FinanceAdmin"},
+  "notes":[]
+}
