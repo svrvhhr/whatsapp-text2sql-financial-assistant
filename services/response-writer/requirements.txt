@@ -3,6 +3,3 @@ uvicorn
 requests
 python-dotenv
 pydantic
-reportlab
-psycopg2-binary
-python-multipart

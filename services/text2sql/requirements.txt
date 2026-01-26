@@ -3,6 +3,8 @@ uvicorn
 psycopg2-binary
 python-dotenv
 requests
+openai
+sqlalchemy
 
 # tests
 pytest

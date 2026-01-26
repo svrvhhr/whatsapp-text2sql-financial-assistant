@@ -10,11 +10,12 @@ services:
     container_name: orionis-postgres
     restart: always
     environment:
+      POSTGRES_HOST: postgres
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
@@ -28,6 +29,13 @@ services:
     restart: always
     env_file:
       - .env
+    environment:
+      TEXT2SQL_URL: "http://text2sql:8000"
+      SQL_GUARD_URL: "http://sql-guard:8000"
+      SQL_EXECUTOR_URL: "http://sql-executor:8000"
+      RESPONSE_WRITER_URL: http://response-writer:8000
+      DEFAULT_ROLE: "ReadOnly"
+      
     ports:
       - "8000:8000"
     depends_on:
@@ -35,20 +43,7 @@ services:
       - text2sql
       - sql-guard
       - sql-executor
-      # - audit
-
-  # =========================
-  # Ollama Service
-  # =========================
-
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    restart: always
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
+      - audit
 
   # =========================
   # Text2SQL Service
@@ -62,7 +57,6 @@ services:
     ports:
       - "8001:8000"
     depends_on:
-      - ollama
       - postgres
 
   # =========================
@@ -93,6 +87,7 @@ services:
       - .env
     environment:
       SQL_GUARD_URL: "http://sql-guard:8000"
+      AUDIT_URL: http://audit:8000
       DB_STATEMENT_TIMEOUT_MS: "5000"
       MAX_RETURN_ROWS: "200"
     ports:
@@ -101,15 +96,59 @@ services:
       - postgres
       - sql-guard
 
-  # # =========================
-  # # Audit Service
-  # # =========================
-  # audit:
-  #   build: ./services/audit
-  #   container_name: audit
-  #   restart: always
-  #   env_file:
-  #     - .env
+  # =========================
+  # Audit Service
+  # =========================
+  audit:
+    build: ./services/audit
+    container_name: audit
+    restart: always
+    env_file:
+      - .env
+    environment:
+      AUDIT_TABLE_NAME: "audit_service_event"
+      AUDIT_AUTO_MIGRATE: "1"
+      LOG_LEVEL: "INFO"
+      AUDIT_TABLE: "audit_service_event"
+    depends_on:
+      - postgres
+    ports:
+      - "8004:8000"
+
+  response-writer:
+    build: ./services/response-writer
+    container_name: response-writer
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - WRITER_TIMEOUT_S=12
+      - WRITER_MAX_ITEMS=10
+      - WRITER_MAX_TEXT_CHARS=1200
+
+      - LLM_PROVIDER=openai
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=https://api.openai.com/v1
+      - OPENAI_MODEL=gpt-4o-mini
+    ports:
+      - "8005:8000"
+
+  audit-ui:
+    build:
+      context: ./services/audit-ui
+    container_name: audit-ui
+    environment:
+      - AUDIT_API_URL=http://audit:8000
+      - AUDIT_ADMIN_USER=admin
+      - AUDIT_ADMIN_PASS=admin
+      - AUDIT_UI_DEFAULT_RANGE_HOURS=24
+      - AUDIT_UI_DEFAULT_LIMIT=200
+      - AUDIT_UI_TIMEOUT_S=10
+    depends_on:
+      - audit
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
 
 # =========================
 # Persistent Volumes

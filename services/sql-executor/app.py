@@ -1,12 +1,18 @@
 import os
 import time
+import json
+import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2
-import psycopg2.extras
+from psycopg2 import OperationalError, IntegrityError, DatabaseError
 import requests
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+import sqlglot
+from sqlglot import exp
 
 
 # =========================================================
@@ -15,14 +21,26 @@ from pydantic import BaseModel
 POSTGRES_DB = os.getenv("POSTGRES_DB", "orionis")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "orionis")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "orionis")
-POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres")
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "orionis-postgres")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 
 SQL_GUARD_URL = os.getenv("SQL_GUARD_URL", "http://sql-guard:8000")
+
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "5000"))
 MAX_RETURN_ROWS = int(os.getenv("MAX_RETURN_ROWS", "200"))
 
 ENV = os.getenv("ENV", "dev")
+
+AUDIT_URL = os.getenv("AUDIT_URL", "http://audit:8000")
+AUDIT_TIMEOUT_S = int(os.getenv("AUDIT_TIMEOUT_S", "5"))
+
+# Retry when DB restarts
+DB_RETRY_ON_OPERATIONAL_ERROR = os.getenv("DB_RETRY_ON_OPERATIONAL_ERROR", "1") == "1"
+DB_RETRY_SLEEP_MS = int(os.getenv("DB_RETRY_SLEEP_MS", "300"))
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(message)s")
+logger = logging.getLogger("sql_executor")
 
 
 # =========================================================
@@ -38,6 +56,7 @@ class StaticChecks(BaseModel):
     ddl_blocked: bool = True
     schema_ok: bool = True
     single_statement: bool = True
+    tenant_scoped: bool = True
 
 
 class SQLPlan(BaseModel):
@@ -50,7 +69,7 @@ class SQLPlan(BaseModel):
     risk: RiskInfo
     static_checks: StaticChecks
     context: Dict[str, Any]
-    notes: List[str] = []
+    notes: List[str] = Field(default_factory=list)
 
 
 class ExecuteResponse(BaseModel):
@@ -58,7 +77,7 @@ class ExecuteResponse(BaseModel):
     request_id: str
     operation: str
     normalized_sql: Optional[str] = None
-    reasons: List[str] = []
+    reasons: List[str] = Field(default_factory=list)
     columns: Optional[List[str]] = None
     rows: Optional[List[List[Any]]] = None
     row_count: Optional[int] = None
@@ -80,83 +99,103 @@ def _pg_connect():
     )
 
 
-def ensure_audit_table(conn):
-    # MVP: create audit table if not exists
-    # (en prod tu feras une migration SQL)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS audit_event (
-              id SERIAL PRIMARY KEY,
-              request_id TEXT,
-              created_at TIMESTAMPTZ DEFAULT NOW(),
-              actor_id TEXT,
-              role TEXT,
-              entreprise_id INT,
-              projet_id INT,
-              operation TEXT,
-              sql TEXT,
-              params JSONB,
-              status TEXT,
-              reasons TEXT,
-              duration_ms INT,
-              row_count INT,
-              affected_rows INT
-            );
-            """
-        )
-        conn.commit()
-
-
-def audit_write(conn, plan: SQLPlan, status: str, reasons: List[str], duration_ms: int, row_count: int, affected_rows: int):
+def set_app_context(cur, plan: SQLPlan) -> None:
+    """
+    Inject context for DB triggers (audit/tracing) via set_config.
+    Your DB triggers can read:
+      current_setting('app.request_id', true), etc.
+    """
     ctx = plan.context or {}
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO audit_event
-              (request_id, actor_id, role, entreprise_id, projet_id,
-               operation, sql, params, status, reasons, duration_ms, row_count, affected_rows)
-            VALUES
-              (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s);
-            """,
-            (
-                plan.request_id,
-                ctx.get("actor_id"),
-                ctx.get("role"),
-                ctx.get("entreprise_id"),
-                ctx.get("projet_id"),
-                plan.operation,
-                plan.sql,
-                psycopg2.extras.Json(plan.params),
-                status,
-                "\n".join(reasons),
-                duration_ms,
-                row_count if row_count >= 0 else None,
-                affected_rows if affected_rows >= 0 else None,
-            ),
-        )
-        conn.commit()
+    cur.execute("SELECT set_config('app.request_id', %s, true);", (str(plan.request_id or ""),))
+    cur.execute("SELECT set_config('app.actor_id', %s, true);", (str(ctx.get("actor_id") or ""),))
+    cur.execute("SELECT set_config('app.role', %s, true);", (str(ctx.get("role") or ""),))
+    cur.execute("SELECT set_config('app.entreprise_id', %s, true);", (str(ctx.get("entreprise_id") or ""),))
+    cur.execute("SELECT set_config('app.projet_id', %s, true);", (str(ctx.get("projet_id") or ""),))
+    cur.execute("SELECT set_config('app.confirmed', %s, true);", (str(ctx.get("confirmed") or ""),))
+
+
+# =========================================================
+# Audit emitter (external service OR stdout JSON)
+# =========================================================
+def emit_audit_event(event: Dict[str, Any]) -> None:
+    """
+    Best-effort:
+    - If AUDIT_URL configured => POST /event
+    - else log JSON to stdout
+    """
+    if AUDIT_URL:
+        try:
+            requests.post(
+                f"{AUDIT_URL.rstrip('/')}/event",
+                json=event,
+                timeout=AUDIT_TIMEOUT_S,
+            )
+            return
+        except Exception:
+            pass
+
+    logger.info(json.dumps({"event": "audit", **event}, ensure_ascii=False))
 
 
 # =========================================================
 # Guard call
 # =========================================================
-def guard_check(plan: SQLPlan) -> Tuple[bool, List[str], str]:
+def guard_check(plan: SQLPlan) -> Tuple[bool, List[str], str, List[Any]]:
+    """
+    Returns:
+      (allowed, reasons, normalized_sql, normalized_params)
+    """
     try:
-        r = requests.post(f"{SQL_GUARD_URL.rstrip('/')}/check", json=plan.model_dump(), timeout=10)
+        r = requests.post(
+            f"{SQL_GUARD_URL.rstrip('/')}/check",
+            json=plan.model_dump(),
+            timeout=10,
+        )
+        r.raise_for_status()
         data = r.json()
+
         allowed = bool(data.get("allowed"))
         reasons = data.get("reasons") or []
-        normalized_sql = data.get("normalized_sql") or plan.sql
-        return allowed, reasons, normalized_sql
+
+        normalized_sql = (data.get("normalized_sql") or plan.sql or "").strip()
+        normalized_params = data.get("normalized_params")
+        if normalized_params is None:
+            normalized_params = plan.params or []
+
+        return allowed, reasons, normalized_sql, list(normalized_params)
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Erreur sql-guard (HTTP): {e}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Erreur appel sql-guard: {e}")
 
 
 # =========================================================
+# SQL parsing helpers
+# =========================================================
+def parse_single_statement(sql: str) -> exp.Expression:
+    statements = sqlglot.parse(sql, read="postgres")
+    if len(statements) != 1:
+        raise ValueError("Multi-statements interdits")
+    return statements[0]
+
+
+def detect_operation(sql: str) -> str:
+    node = parse_single_statement(sql)
+    if isinstance(node, exp.Select):
+        return "SELECT"
+    if isinstance(node, exp.Insert):
+        return "INSERT"
+    if isinstance(node, exp.Update):
+        return "UPDATE"
+    if isinstance(node, exp.Delete):
+        return "DELETE"
+    return "UNKNOWN"
+
+
+# =========================================================
 # FastAPI
 # =========================================================
-app = FastAPI(title="SQL Executor Service", version="1.0.0")
+app = FastAPI(title="SQL Executor Service", version="2.1.0")
 
 
 @app.get("/health")
@@ -165,6 +204,9 @@ def health():
     err = None
     try:
         conn = _pg_connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+            cur.fetchone()
         conn.close()
     except Exception as e:
         ok = False
@@ -177,95 +219,200 @@ def health():
         "sql_guard_url": SQL_GUARD_URL,
         "db_statement_timeout_ms": DB_STATEMENT_TIMEOUT_MS,
         "max_return_rows": MAX_RETURN_ROWS,
+        "audit_url": AUDIT_URL or None,
         "db_error": err,
     }
 
 
 @app.post("/execute", response_model=ExecuteResponse)
 def execute(plan: SQLPlan):
-    # 1) Guard decision (final technical gate)
-    allowed, reasons, normalized_sql = guard_check(plan)
-    if not allowed:
-        # audit refused (best effort)
-        try:
-            conn = _pg_connect()
-            ensure_audit_table(conn)
-            audit_write(conn, plan, "refused", reasons, duration_ms=0, row_count=-1, affected_rows=-1)
-            conn.close()
-        except Exception:
-            pass
+    start = time.time()
+    normalized_sql = plan.sql
+    normalized_params: List[Any] = list(plan.params or [])
 
+    # 1) Guard decision (final gate)
+    allowed, reasons, normalized_sql, normalized_params = guard_check(plan)
+
+    # petit check de “SQL cassé”
+    if re.search(r"\bLIMIT\s*$", normalized_sql, re.I):
+        allowed = False
+        reasons = reasons + ["Executor: SQL invalide (LIMIT sans valeur)."]
+
+    # 2) Detect operation from normalized SQL (anti mismatch)
+    try:
+        op_real = detect_operation(normalized_sql)
+    except Exception as e:
+        allowed = False
+        reasons = reasons + [f"Executor: SQL non parsable: {e}"]
+        op_real = (plan.operation or "UNKNOWN").upper()
+
+    op_plan = (plan.operation or "UNKNOWN").upper()
+    if allowed and op_real != op_plan and op_real != "UNKNOWN":
+        allowed = False
+        reasons = reasons + [f"Executor: opération incohérente (plan={op_plan} sql={op_real})."]
+
+    # 3) If refused, audit + return
+    if not allowed:
+        duration_ms = int((time.time() - start) * 1000)
+        emit_audit_event({
+            "request_id": plan.request_id,
+            "status": "refused",
+            "operation": op_real,
+            "sql": normalized_sql,
+            "params": normalized_params,
+            "reasons": reasons[:20],
+            "duration_ms": duration_ms,
+            "context": plan.context or {},
+        })
         return ExecuteResponse(
             status="refused",
             request_id=plan.request_id,
-            operation=plan.operation,
+            operation=op_real,
             normalized_sql=normalized_sql,
             reasons=reasons,
+            duration_ms=duration_ms,
         )
 
-    # 2) Execute with timeout + transaction
-    start = time.time()
-    row_count = 0
-    affected_rows = 0
-
-    try:
+    # 4) Execute with timeout + transaction
+    def _run_once() -> ExecuteResponse:
         conn = _pg_connect()
-        ensure_audit_table(conn)
+        try:
+            with conn.cursor() as cur:
+                # statement_timeout needs a transaction scope
+                cur.execute("SET LOCAL statement_timeout = %s;", (DB_STATEMENT_TIMEOUT_MS,))
 
-        with conn.cursor() as cur:
-            # Statement timeout for safety
-            cur.execute("SET LOCAL statement_timeout = %s;", (DB_STATEMENT_TIMEOUT_MS,))
-            cur.execute(normalized_sql, tuple(plan.params))
+                # Inject context for DB triggers/audit
+                set_app_context(cur, plan)
 
-            op = plan.operation.upper()
+                cur.execute(normalized_sql, tuple(normalized_params))
 
-            if op == "SELECT":
-                rows = cur.fetchmany(MAX_RETURN_ROWS)
-                columns = [desc[0] for desc in cur.description] if cur.description else []
-                row_count = len(rows)
-                duration_ms = int((time.time() - start) * 1000)
+                if op_real == "SELECT":
+                    rows = cur.fetchmany(MAX_RETURN_ROWS)
+                    columns = [desc[0] for desc in cur.description] if cur.description else []
+                    row_count = len(rows)
+                    duration_ms = int((time.time() - start) * 1000)
 
-                audit_write(conn, plan, "executed", [], duration_ms, row_count=row_count, affected_rows=-1)
-                conn.close()
+                    emit_audit_event({
+                        "request_id": plan.request_id,
+                        "status": "executed",
+                        "operation": op_real,
+                        "sql": normalized_sql,
+                        "params": normalized_params,
+                        "row_count": row_count,
+                        "affected_rows": None,
+                        "duration_ms": duration_ms,
+                        "context": plan.context or {},
+                    })
 
-                return ExecuteResponse(
-                    status="executed",
-                    request_id=plan.request_id,
-                    operation=op,
-                    normalized_sql=normalized_sql,
-                    columns=columns,
-                    rows=[list(r) for r in rows],
-                    row_count=row_count,
-                    duration_ms=duration_ms,
-                )
+                    return ExecuteResponse(
+                        status="executed",
+                        request_id=plan.request_id,
+                        operation=op_real,
+                        normalized_sql=normalized_sql,
+                        columns=columns,
+                        rows=[list(r) for r in rows],
+                        row_count=row_count,
+                        duration_ms=duration_ms,
+                    )
 
-            else:
-                # INSERT/UPDATE/DELETE
                 affected_rows = cur.rowcount if cur.rowcount is not None else 0
                 conn.commit()
                 duration_ms = int((time.time() - start) * 1000)
 
-                audit_write(conn, plan, "executed", [], duration_ms, row_count=-1, affected_rows=affected_rows)
-                conn.close()
+                emit_audit_event({
+                    "request_id": plan.request_id,
+                    "status": "executed",
+                    "operation": op_real,
+                    "sql": normalized_sql,
+                    "params": normalized_params,
+                    "row_count": None,
+                    "affected_rows": int(affected_rows),
+                    "duration_ms": duration_ms,
+                    "context": plan.context or {},
+                })
 
                 return ExecuteResponse(
                     status="executed",
                     request_id=plan.request_id,
-                    operation=op,
+                    operation=op_real,
                     normalized_sql=normalized_sql,
-                    affected_rows=affected_rows,
+                    affected_rows=int(affected_rows),
                     duration_ms=duration_ms,
                 )
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    try:
+        try:
+            return _run_once()
+        except OperationalError as e:
+            # DB restarted / connection reset
+            if DB_RETRY_ON_OPERATIONAL_ERROR:
+                time.sleep(DB_RETRY_SLEEP_MS / 1000.0)
+                return _run_once()
+            raise
+
+    except OperationalError as e:
+        duration_ms = int((time.time() - start) * 1000)
+        logger.exception("DB unavailable (OperationalError)")
+        emit_audit_event({
+            "request_id": plan.request_id,
+            "status": "db_unavailable",
+            "operation": op_real,
+            "sql": normalized_sql,
+            "params": normalized_params,
+            "reasons": [str(e)],
+            "duration_ms": duration_ms,
+            "context": plan.context or {},
+        })
+        raise HTTPException(status_code=503, detail={"status": "db_unavailable", "error": str(e)})
+
+    except IntegrityError as e:
+        # NOT NULL / FK / UNIQUE / CHECK
+        duration_ms = int((time.time() - start) * 1000)
+        logger.exception("Constraint error (IntegrityError)")
+        emit_audit_event({
+            "request_id": plan.request_id,
+            "status": "constraint_error",
+            "operation": op_real,
+            "sql": normalized_sql,
+            "params": normalized_params,
+            "reasons": [str(e)],
+            "duration_ms": duration_ms,
+            "context": plan.context or {},
+        })
+        raise HTTPException(status_code=409, detail={"status": "constraint_error", "error": str(e)})
+
+    except DatabaseError as e:
+        # SQL error, column missing, etc.
+        duration_ms = int((time.time() - start) * 1000)
+        logger.exception("Database error (DatabaseError)")
+        emit_audit_event({
+            "request_id": plan.request_id,
+            "status": "db_error",
+            "operation": op_real,
+            "sql": normalized_sql,
+            "params": normalized_params,
+            "reasons": [str(e)],
+            "duration_ms": duration_ms,
+            "context": plan.context or {},
+        })
+        raise HTTPException(status_code=400, detail={"status": "db_error", "error": str(e)})
 
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
-        # Try audit error
-        try:
-            conn = _pg_connect()
-            ensure_audit_table(conn)
-            audit_write(conn, plan, "error", [str(e)], duration_ms, row_count=-1, affected_rows=-1)
-            conn.close()
-        except Exception:
-            pass
-
-        raise HTTPException(status_code=500, detail=f"Erreur exécution SQL: {e}")
+        logger.exception("Internal error")
+        emit_audit_event({
+            "request_id": plan.request_id,
+            "status": "internal_error",
+            "operation": op_real,
+            "sql": normalized_sql,
+            "params": normalized_params,
+            "reasons": [str(e)],
+            "duration_ms": duration_ms,
+            "context": plan.context or {},
+        })
+        raise HTTPException(status_code=500, detail={"status": "internal_error", "error": str(e)})
