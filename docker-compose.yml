@@ -150,9 +150,20 @@ services:
       - "8501:8501"
     restart: unless-stopped
 
+  test-ui-streamlit:
+    build:
+      context: ./services/test-ui-streamlit
+    container_name: test-ui-streamlit
+    environment:
+      - API_GATEWAY_SIMULATE_URL=http://api-gateway:8000/simulate
+      - TEST_UI_TIMEOUT_S=30
+    ports:
+      - "8502:8502"
+    depends_on:
+      - api-gateway
+
 # =========================
 # Persistent Volumes
 # =========================
 volumes:
   postgres_data:
-  ollama_data:

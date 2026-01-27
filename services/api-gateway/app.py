@@ -591,6 +591,232 @@ def health():
         "public_base_url": PUBLIC_BASE_URL or None,
     }
 
+# =========================================================
+# TEST UI STREAMING endpoint
+# =========================================================
+from pydantic import BaseModel
+
+class SimulateIn(BaseModel):
+    actor_id: str
+    body: str
+
+class SimulateOut(BaseModel):
+    reply: str
+
+
+def _format_clarification_message(state: Dict[str, Any]) -> str:
+    # tu as déjà render_clarification_message(state)
+    return render_clarification_message(state)
+
+
+def _simulate_send_message(actor_id: str, original_user_text: str, user_message: Optional[str] = None, error_message: Optional[str] = None) -> str:
+    """
+    Version simulate de _send_user_message: retourne le texte final au lieu de l'envoyer à Twilio.
+    """
+    lang = detect_lang(original_user_text)
+    payload = {
+        "request_id": str(uuid.uuid4()),
+        "lang": lang,
+        "channel": "simulate",
+        "intent": "system_message",
+        "operation": "MESSAGE",
+        "rows": [],
+        "columns": [],
+        "user_message": user_message,
+        "error_message": error_message,
+    }
+    txt = call_response_writer(payload) or (user_message or error_message or "OK")
+    return txt
+
+
+def _simulate_send_select(actor_id: str, user_text: str, plan: Dict[str, Any], result: Dict[str, Any]) -> str:
+    columns = result.get("columns") or []
+    rows = result.get("rows") or []
+
+    # pas de PDF en simulate (sinon tu vas gérer des fichiers etc.)
+    rows_dicts: List[Dict[str, Any]] = []
+    for r in rows[:100]:
+        d = {}
+        for i, c in enumerate(columns):
+            d[c] = r[i] if i < len(r) else None
+        rows_dicts.append(d)
+
+    writer_payload = {
+        "request_id": str(uuid.uuid4()),
+        "lang": detect_lang(user_text),
+        "channel": "simulate",
+        "intent": plan.get("intent") or "select_result",
+        "operation": "SELECT",
+        "rows": rows_dicts,
+        "columns": columns,
+    }
+    txt = call_response_writer(writer_payload)
+    if not txt:
+        txt = fallback_format_select(columns, rows, max_rows=5)
+    return txt
+
+
+def _simulate_send_write(actor_id: str, user_text: str, plan: Dict[str, Any], result: Dict[str, Any]) -> str:
+    op = (result.get("operation") or plan.get("operation") or "").upper()
+    writer_payload = {
+        "request_id": str(uuid.uuid4()),
+        "lang": detect_lang(user_text),
+        "channel": "simulate",
+        "intent": plan.get("intent") or "write_result",
+        "operation": op or "EXECUTED",
+        "rows": [],
+        "columns": [],
+        "user_message": f"✅ {op} exécuté. affected_rows={result.get('affected_rows')}",
+    }
+    return call_response_writer(writer_payload) or f"✅ {op} exécuté. affected_rows={result.get('affected_rows')}"
+
+
+def _simulate_execute_plan(actor_id: str, user_text: str, plan: Dict[str, Any]) -> str:
+    """
+    Guard → Executor → Writer/Fallback => retourne le texte final.
+    """
+    guard = post_json(f"{SQL_GUARD_URL.rstrip('/')}/check", plan)
+    if not guard.get("allowed", False):
+        reasons = guard.get("reasons") or []
+        return _simulate_send_message(actor_id, user_text, error_message="Requête refusée:\n- " + "\n- ".join(reasons[:6]))
+
+    exec_payload = dict(plan)
+    exec_payload["sql"] = guard.get("normalized_sql") or plan.get("sql")
+    exec_payload["params"] = guard.get("normalized_params") or plan.get("params", [])
+
+    result = post_json(f"{SQL_EXECUTOR_URL.rstrip('/')}/execute", exec_payload)
+    if result.get("status") != "executed":
+        reasons = result.get("reasons") or []
+        return _simulate_send_message(
+            actor_id,
+            user_text,
+            error_message=f"Non exécuté ({result.get('status')}).\n" + ("\n".join(reasons) if reasons else "")
+        )
+
+    op = (result.get("operation") or plan.get("operation") or "").upper()
+    if op == "SELECT":
+        return _simulate_send_select(actor_id, user_text, plan, result)
+    return _simulate_send_write(actor_id, user_text, plan, result)
+
+
+def _simulate_run_pipeline(actor_id: str, user_text: str) -> str:
+    """
+    Version sync de _run_pipeline: Text2SQL → Clarification? → Confirmation? → Execute
+    """
+    convert_payload = {"user_input": user_text, "actor_id": actor_id}
+    plan, err = post_json_allow_400(f"{TEXT2SQL_URL.rstrip('/')}/convert", convert_payload)
+    if err:
+        return _simulate_send_message(actor_id, user_text, error_message=f"Requête refusée (Text2SQL): {err}")
+
+    clarification = plan.get("clarification") or {}
+    if clarification.get("needed"):
+        _clarify_set(actor_id, original_text=user_text, plan=plan)
+        stt = _clarify_get(actor_id) or {}
+        msg = _format_clarification_message(stt)
+        return _simulate_send_message(actor_id, user_text, user_message=msg)
+
+    if plan_needs_confirmation(plan):
+        _pending_set(actor_id, plan, user_text)
+        return build_confirmation_message(plan)
+
+    return _simulate_execute_plan(actor_id, user_text, plan)
+
+
+@app.post("/simulate", response_model=SimulateOut)
+def simulate(payload: SimulateIn):
+    """
+    Simule WhatsApp sans Twilio.
+    Retourne uniquement le texte final affiché.
+    """
+    actor_id = normalize_whatsapp_number(payload.actor_id)
+    user_text = (payload.body or "").strip()
+    if not user_text:
+        return {"reply": "Message vide."}
+
+    # Security prefilter (same as webhook)
+    if SQL_INJECTION_MARKERS_RE.search(user_text):
+        return {"reply": "❌ Requête refusée : caractères SQL non autorisés détectés (;, --, /* */). Reformule sans symboles SQL."}
+
+    # 0) Clarification flow
+    clarify = _clarify_get(actor_id)
+    if clarify:
+        if _CMD_CANCEL.match(user_text):
+            _clarify_clear(actor_id)
+            return {"reply": "✅ Ok, j’ai annulé."}
+
+        if _CMD_SHOW.match(user_text):
+            return {"reply": _format_clarification_message(clarify)}
+
+        if _CMD_EDIT.match(user_text):
+            _clarify_clear(actor_id)
+            return {"reply": "D’accord 🙂 Réécris ta demande en précisant le nom (ex: ‘Migration ERP’)."}
+
+        suggestions = clarify.get("suggestions") or []
+        m = _CHOICE_NUM.match(user_text)
+
+        # Si on a une liste => choix par numéro obligatoire
+        if suggestions:
+            if not m:
+                return {"reply": "Réponds avec un numéro (ex: 1), ou Annuler."}
+
+            choice = int(m.group(1))
+            selected = next((s for s in suggestions if int(s.get("option", -1)) == choice), None)
+            if not selected:
+                return {"reply": "Choix invalide. Réponds avec un numéro de la liste, ou RETOUR."}
+
+            plan = clarify.get("plan") or {}
+            field = clarify.get("field") or "resolved_id"
+            original_text = clarify.get("original_text") or ""
+
+            _clarify_clear(actor_id)
+
+            try:
+                patched_plan = apply_choice_to_plan(plan, field, selected)
+
+                if plan_needs_confirmation(patched_plan):
+                    _pending_set(actor_id, patched_plan, original_text)
+                    return {"reply": build_confirmation_message(patched_plan)}
+
+                reply = _simulate_execute_plan(actor_id, original_text, patched_plan)
+                return {"reply": reply}
+            except Exception as e:
+                return {"reply": f"❌ Erreur interne: {e}"}
+
+        # Si pas de suggestions => toute réponse = précision, on relance pipeline
+        _clarify_clear(actor_id)
+        return {"reply": _simulate_run_pipeline(actor_id, user_text)}
+
+    # 1) Confirmation flow
+    pending = _pending_get(actor_id)
+    if pending:
+        if _CMD_CANCEL.match(user_text) or _CONFIRM_NO.match(user_text):
+            _pending_clear(actor_id)
+            return {"reply": "✅ Annulé. Rien n’a été exécuté."}
+
+        if _CONFIRM_YES.match(user_text):
+            try:
+                plan = pending["plan"]
+                ctx = plan.get("context") or {}
+                ctx["confirmed"] = True
+                plan["context"] = ctx
+                reply = _simulate_execute_plan(actor_id, pending.get("user_text") or plan.get("user_input") or "", plan)
+                return {"reply": reply}
+            except Exception as e:
+                return {"reply": f"❌ Erreur interne: {e}"}
+            finally:
+                _pending_clear(actor_id)
+
+        return {"reply": "Je n’ai pas compris. Réponds OUI pour confirmer ou NON/ANNULER pour annuler."}
+
+    # 2) Routing (optional)
+    route, immediate_reply = route_message(user_text)
+    if route in ("smalltalk", "out_of_scope"):
+        return {"reply": immediate_reply or ""}
+
+    # 3) Normal pipeline
+    reply = _simulate_run_pipeline(actor_id, user_text)
+    return {"reply": reply}
+
 
 @app.get("/whatsapp/webhook")
 def whatsapp_webhook_get():
