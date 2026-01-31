@@ -276,6 +276,46 @@ def extract_columns(node: exp.Expression) -> List[Tuple[Optional[str], str]]:
 def has_where_clause(node: exp.Expression) -> bool:
     return node.args.get("where") is not None
 
+TOP_N_PATTERNS = [
+    # EN: top 3 / last 5 / first 10
+    r"\b(top|last|first)\s+(\d{1,3})\b",
+
+    # FR: dernières 5 / premières 10
+    r"\b(derni[eè]res?|premi[eè]res?)\s+(\d{1,3})\b",
+
+    # FR: les 3 grandes / 3 plus grandes / 3 importantes / 3 plus importantes
+    r"\b(\d{1,3})\s+(plus\s+)?(grandes?|grosses?|importantes?)\b",
+
+    # FR: les 3 plus grandes dépenses / 3 plus grosses dépenses (avec nom après)
+    r"\b(\d{1,3})\s+(plus\s+)?(grandes?|grosses?|importantes?)\s+\w+\b",
+
+    # FR: 5 dernières / 10 premières (nombre avant)
+    r"\b(\d{1,3})\s+derni[eè]res?\b",
+    r"\b(\d{1,3})\s+premi[eè]res?\b",
+]
+
+def extract_requested_limit(user_input: str) -> Optional[int]:
+    if not user_input:
+        return None
+
+    s = user_input.lower()
+
+    for pattern in TOP_N_PATTERNS:
+        m = re.search(pattern, s, flags=re.I)
+        if not m:
+            continue
+
+        # On récupère le 1er groupe "numérique" trouvé
+        for g in m.groups():
+            if g and g.isdigit():
+                n = int(g)
+                # garde-fous
+                if n <= 0:
+                    return None
+                return n
+
+    return None
+
 
 def select_has_limit(node: exp.Expression) -> bool:
     sel = node if isinstance(node, exp.Select) else node.find(exp.Select)
@@ -816,7 +856,7 @@ def check(plan: SQLPlan):
     sql = strip_ansi(sql)
     params = list(plan.params or [])
 
-    print("SQL_RECV:", repr(sql)) 
+    # print("SQL_RECV:", repr(sql)) 
 
     if re.search(r"\bLIMIT\s*$", sql, re.I):
         return GuardResponse(
@@ -830,16 +870,19 @@ def check(plan: SQLPlan):
             verified_entreprise_id=verified_entreprise_id,
         )
 
+    
     # -------------------------
     # (A) User verification
     # -------------------------
-    actor_id = ctx.get("actor_id")  # Twilio "From" -> forwarded by gateway
-
+    actor_id = ctx.get("actor_id")
     entreprise_id = ctx.get("entreprise_id")
 
     verified_user = None
     verified_role = None
     verified_entreprise_id = entreprise_id
+
+    # On ne fait PAS confiance au rôle venant du gateway (ctx["role"])
+    role_to_use = None
 
     if REQUIRE_USER_VERIFICATION:
         if not actor_id:
@@ -850,15 +893,28 @@ def check(plan: SQLPlan):
                 reasons.append("User verification: utilisateur inconnu (numero_whatsapp).")
             else:
                 verified_role = verified_user.get("role")
+                role_to_use = verified_role
 
-                # Entreprise authorization
-                if entreprise_id is not None:
-                    allowed_ents = verified_user.get("entreprises", [])
-                    if entreprise_id not in allowed_ents and verified_role != "System":
-                        reasons.append("User verification: utilisateur non autorisé sur cette entreprise_id.")
+                allowed_ents = verified_user.get("entreprises", [])
 
-    # If role not provided, use verified role
-    role_to_use = verified_role
+                # Si entreprise_id fourni, il doit appartenir à l'utilisateur
+                if entreprise_id is not None and entreprise_id not in allowed_ents:
+                    reasons.append("Tenant scope: entreprise_id non autorisée pour cet utilisateur.")
+
+                # Déduction SAFE : uniquement si 1 seule entreprise
+                if entreprise_id is None:
+                    if len(allowed_ents) == 1:
+                        entreprise_id = allowed_ents[0]
+                        ctx["entreprise_id"] = entreprise_id
+                        verified_entreprise_id = entreprise_id
+                    else:
+                        reasons.append("Tenant scope: entreprise_id obligatoire (utilisateur multi-entreprises).")
+
+    # Exiger le scope tenant si activé
+    if REQUIRE_TENANT_SCOPE and entreprise_id is None:
+        reasons.append("Tenant scope: entreprise_id obligatoire (manquant).")
+
+    # Si on n'a pas d'utilisateur ou pas de rôle -> on stoppe
     if REQUIRE_USER_VERIFICATION and (not verified_user or not verified_role):
         return GuardResponse(
             allowed=False,
@@ -927,7 +983,13 @@ def check(plan: SQLPlan):
 
             if not select_has_limit(node):
                 if GUARD_AUTO_LIMIT:
-                    normalized_sql = inject_limit_safe(sql, GUARD_MAX_ROWS)
+                    requested = extract_requested_limit(plan.user_input)
+                    limit = GUARD_MAX_ROWS
+                    if requested is not None:
+                        limit = min(requested, GUARD_MAX_ROWS)
+
+                    normalized_sql = inject_limit_safe(sql, limit)
+
 
                     # Re-parse pour confirmer que c’est valide
                     try:
@@ -947,11 +1009,11 @@ def check(plan: SQLPlan):
     # (F) Tenant scope enforcement (guard-side)
     # -------------------------
     if entreprise_id is not None and node is not None:
-        if op in ("SELECT", "UPDATE", "DELETE"):
-            if not ast_has_entreprise_filter(node):
-                msg = "Tenant scope: filtre entreprise_id manquant dans WHERE."
-                if REQUIRE_TENANT_SCOPE:
-                    reasons.append(msg)
+        if node is not None and op in ("SELECT", "UPDATE", "DELETE"):
+            if REQUIRE_TENANT_SCOPE and not ast_has_entreprise_filter(node):
+                reasons.append("Tenant scope: filtre entreprise_id manquant dans WHERE.")
+
+
         elif op == "INSERT":
             # INSERT: on ne demande pas de WHERE, on s'appuie sur la validation métier.
             # Donc rien ici.

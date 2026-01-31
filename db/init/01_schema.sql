@@ -523,6 +523,67 @@ END;
 $$;
 
 
+-- Apply account balance changes for transfert_interne
+CREATE OR REPLACE FUNCTION public.apply_solde_transfert()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    -- Débit du compte source
+    UPDATE compte_financier
+      SET solde = solde - NEW.montant
+    WHERE id = NEW.compte_source_id;
+
+    -- Crédit du compte destination
+    UPDATE compte_financier
+      SET solde = solde + NEW.montant
+    WHERE id = NEW.compte_destination_id;
+
+    RETURN NEW;
+
+  ELSIF TG_OP = 'DELETE' THEN
+    -- Annulation du transfert
+    UPDATE compte_financier
+      SET solde = solde + OLD.montant
+    WHERE id = OLD.compte_source_id;
+
+    UPDATE compte_financier
+      SET solde = solde - OLD.montant
+    WHERE id = OLD.compte_destination_id;
+
+    RETURN OLD;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+-- Check source account balance before transfert
+CREATE OR REPLACE FUNCTION public.check_solde_transfert()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  solde_source NUMERIC;
+BEGIN
+  SELECT solde INTO solde_source
+  FROM compte_financier
+  WHERE id = NEW.compte_source_id;
+
+  IF solde_source IS NULL THEN
+    RAISE EXCEPTION 'Compte source % introuvable', NEW.compte_source_id;
+  END IF;
+
+  IF solde_source - NEW.montant < 0 THEN
+    RAISE EXCEPTION 'Solde insuffisant sur le compte source %', NEW.compte_source_id;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
 -- =========================================================
 -- TABLES + SEQUENCES
 -- =========================================================
@@ -722,6 +783,23 @@ CREATE TABLE public.transfert_interne (
 CREATE SEQUENCE public.transfert_interne_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1;
 ALTER SEQUENCE public.transfert_interne_id_seq OWNED BY public.transfert_interne.id;
 
+CREATE TABLE IF NOT EXISTS taux_change (
+  id          BIGSERIAL PRIMARY KEY,
+  date_rate   DATE NOT NULL,
+  from_devise VARCHAR(10) NOT NULL,
+  to_devise   VARCHAR(10) NOT NULL,
+  rate        NUMERIC(18,8) NOT NULL,
+  source      TEXT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  CONSTRAINT ck_taux_change_rate_positive CHECK (rate > 0),
+  CONSTRAINT ck_taux_change_pair_not_equal CHECK (from_devise <> to_devise),
+  CONSTRAINT uq_taux_change_pair_day UNIQUE (date_rate, from_devise, to_devise)
+);
+
+CREATE INDEX IF NOT EXISTS ix_taux_change_lookup
+ON taux_change (from_devise, to_devise, date_rate DESC);
+
 
 -- =========================================================
 -- DEFAULTS (serial)
@@ -838,6 +916,7 @@ CREATE INDEX IF NOT EXISTS idx_utilisateur_entreprise_entreprise_id ON public.ut
 -- =========================================================
 
 -- updated_at everywhere
+
 CREATE TRIGGER trg_set_updated_at_entreprise BEFORE UPDATE ON public.entreprise FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 CREATE TRIGGER trg_set_updated_at_role BEFORE UPDATE ON public.role FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 CREATE TRIGGER trg_set_updated_at_utilisateur BEFORE UPDATE ON public.utilisateur FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
@@ -884,6 +963,20 @@ FOR EACH ROW EXECUTE FUNCTION public.apply_solde_depense();
 -- transfert integrity
 CREATE TRIGGER trg_validate_transfert BEFORE INSERT OR UPDATE ON public.transfert_interne
 FOR EACH ROW EXECUTE FUNCTION public.validate_transfert_integrity();
+
+DROP TRIGGER IF EXISTS trg_check_solde_transfert ON public.transfert_interne;
+
+CREATE TRIGGER trg_check_solde_transfert
+BEFORE INSERT OR UPDATE ON public.transfert_interne
+FOR EACH ROW
+EXECUTE FUNCTION public.check_solde_transfert();
+
+DROP TRIGGER IF EXISTS trg_apply_solde_transfert ON public.transfert_interne;
+
+CREATE TRIGGER trg_apply_solde_transfert
+AFTER INSERT OR DELETE ON public.transfert_interne
+FOR EACH ROW
+EXECUTE FUNCTION public.apply_solde_transfert();
 
 
 -- =========================================================

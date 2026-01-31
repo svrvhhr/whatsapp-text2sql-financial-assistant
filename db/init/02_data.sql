@@ -203,6 +203,13 @@ VALUES
   (4, 11,12,60000.00, 'SYP', '2025-01-20')
 ON CONFLICT (id) DO NOTHING;
 
+
+-- INSERT INTO taux_change(date_rate, from_devise, to_devise, rate, source)
+-- VALUES
+--   ('2026-01-27', 'EUR', 'USD', 1.08650000, 'manual-demo'),
+--   ('2026-01-27', 'EUR', 'DZD', 146.32000000, 'manual-demo'),
+--   ('2026-01-27', 'EUR', 'AED', 3.99000000, 'manual-demo');
+
 -- ---------------------------------------------------------
 -- Sequence alignment
 -- ---------------------------------------------------------

@@ -191,6 +191,40 @@ def detect_operation(sql: str) -> str:
         return "DELETE"
     return "UNKNOWN"
 
+def map_db_error(e: Exception) -> Tuple[int, Dict[str, Any], str]:
+    """
+    Retourne:
+      - http_status
+      - detail dict (propre côté client)
+      - audit_status (tag court pour audit)
+    """
+    msg = str(e) or ""
+
+    # ---- Budget dépassé (trigger check_budget_projet)
+    if re.search(r"Depassement du budget du projet", msg, re.IGNORECASE):
+        m = re.search(r"projet\s+(\d+)", msg, re.IGNORECASE)
+        projet_id = int(m.group(1)) if m else None
+
+        return 409, {
+            "status": "rejected",
+            "error_type": "BUDGET_EXCEEDED",
+            "user_message": (
+                "❌ Dépassement de budget.\n"
+                "Cette dépense ne peut pas être enregistrée"
+                + (f" pour le projet #{projet_id}." if projet_id else ".")
+                + "\n👉 Réduis le montant, change de projet, ou augmente le budget."
+            ),
+            # On garde le détail technique pour debug, mais l’interface WhatsApp NE doit pas l’afficher
+            "technical_message": msg,
+        }, "business_rule"
+
+    # ---- fallback DB
+    return 400, {
+        "status": "db_error",
+        "error_type": "DB_ERROR",
+        "user_message": "❌ Erreur lors de l’enregistrement. Modifie la demande et réessaie.",
+        "technical_message": msg,
+    }, "db_error"
 
 # =========================================================
 # FastAPI
@@ -368,7 +402,16 @@ def execute(plan: SQLPlan):
             "duration_ms": duration_ms,
             "context": plan.context or {},
         })
-        raise HTTPException(status_code=503, detail={"status": "db_unavailable", "error": str(e)})
+        raise HTTPException(
+    status_code=503,
+    detail={
+        "status": "db_unavailable",
+        "error_type": "DB_UNAVAILABLE",
+        "user_message": "⚠️ Base de données indisponible. Réessaie dans quelques minutes.",
+        "technical_message": str(e),
+    },
+)
+
 
     except IntegrityError as e:
         # NOT NULL / FK / UNIQUE / CHECK
@@ -384,23 +427,36 @@ def execute(plan: SQLPlan):
             "duration_ms": duration_ms,
             "context": plan.context or {},
         })
-        raise HTTPException(status_code=409, detail={"status": "constraint_error", "error": str(e)})
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "status": "constraint_error",
+                "error_type": "DB_CONSTRAINT",
+                "user_message": "❌ Données invalides (contrainte). Vérifie le projet/compte/date/montant et réessaie.",
+                "technical_message": str(e),
+            },
+        )
 
     except DatabaseError as e:
-        # SQL error, column missing, etc.
         duration_ms = int((time.time() - start) * 1000)
         logger.exception("Database error (DatabaseError)")
+
+        http_status, detail, audit_status = map_db_error(e)
+
         emit_audit_event({
             "request_id": plan.request_id,
-            "status": "db_error",
+            "status": audit_status,          # <-- au lieu de db_error brut
             "operation": op_real,
             "sql": normalized_sql,
             "params": normalized_params,
-            "reasons": [str(e)],
+            "reasons": [detail.get("technical_message", str(e))],
             "duration_ms": duration_ms,
             "context": plan.context or {},
+            "error_type": detail.get("error_type"),
         })
-        raise HTTPException(status_code=400, detail={"status": "db_error", "error": str(e)})
+
+        raise HTTPException(status_code=http_status, detail=detail)
+
 
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
@@ -415,4 +471,12 @@ def execute(plan: SQLPlan):
             "duration_ms": duration_ms,
             "context": plan.context or {},
         })
-        raise HTTPException(status_code=500, detail={"status": "internal_error", "error": str(e)})
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "internal_error",
+                "error_type": "INTERNAL",
+                "user_message": "❌ Erreur interne. Réessaie ou contacte un administrateur.",
+                "technical_message": str(e),
+            },
+        )

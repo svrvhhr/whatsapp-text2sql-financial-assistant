@@ -54,6 +54,10 @@ app = FastAPI(title="API Gateway", version="1.6.0")
 # Security prefilter (block obvious SQL injection markers)
 # =========================================================
 SQL_INJECTION_MARKERS_RE = re.compile(r"(;|--|/\*|\*/)", re.IGNORECASE)
+SQL_KEYWORDS_RE = re.compile(r"\b(select|insert|update|delete|drop|truncate|alter|create)\b", re.I)
+
+
+
 
 # =========================================================
 # In-memory pending confirmations (actor_id -> payload)
@@ -73,6 +77,27 @@ _CLARIFY_LOCK = Lock()
 _FILES: Dict[str, Dict[str, Any]] = {}
 FILES_LOCK = Lock()
 
+# =========================================================
+# In-memory user context (actor_id -> context)
+# =========================================================
+_USER_CTX: Dict[str, Dict[str, Any]] = {}
+_USER_CTX_LOCK = Lock()
+
+def _user_ctx_get(actor_id: str) -> Dict[str, Any]:
+    with _USER_CTX_LOCK:
+        return dict(_USER_CTX.get(actor_id) or {})
+
+def _user_ctx_merge(actor_id: str, ctx_updates: Dict[str, Any]) -> None:
+    if not actor_id:
+        return
+    with _USER_CTX_LOCK:
+        base = dict(_USER_CTX.get(actor_id) or {})
+        base.update({k: v for k, v in (ctx_updates or {}).items() if v is not None})
+        _USER_CTX[actor_id] = base
+
+def _user_ctx_clear(actor_id: str) -> None:
+    with _USER_CTX_LOCK:
+        _USER_CTX.pop(actor_id, None)
 # =========================================================
 # Commands / patterns
 # =========================================================
@@ -155,6 +180,7 @@ def _clarify_set(actor_id: str, original_text: str, plan: Dict[str, Any]) -> Non
             "message": clar.get("message"),
             "suggestions": clar.get("suggestions") or [],
         }
+    _user_ctx_merge(actor_id, plan.get("context") or {})
 
 
 def _clarify_update(actor_id: str, plan: Dict[str, Any], original_text: str) -> None:
@@ -250,6 +276,65 @@ def twiml_message(text: str) -> str:
 </Response>
 """
 
+def ux_error_message(user_text: str, source: str, raw: str = "", reasons: Optional[List[str]] = None) -> str:
+    """
+    Retourne un message WhatsApp propre.
+    source: text2sql|guard|executor|gateway
+    raw: string brute (HTTPException detail, etc.)
+    reasons: liste reasons guard (ne jamais afficher brute)
+    """
+    lang = detect_lang(user_text)
+
+    # Normalize text
+    txt = (raw or "").lower()
+    r = " ".join([(x or "") for x in (reasons or [])]).lower()
+
+    # --- Cas fréquents Guard / parsing
+    if "limit sans valeur" in txt or "limit sans valeur" in r:
+        return "❌ Requête invalide. Reformule sans morceau SQL incomplet (ex: évite 'LIMIT' seul)."
+
+    if "parse ast" in txt or "parse ast" in r or "sql non parsable" in txt or "invalid" in txt:
+        return (
+            "❌ Je n’ai pas compris la demande.\n"
+            "👉 Reformule en phrase simple (sans SQL).\n"
+            "Ex: « Montre les 10 dernières dépenses du projet X »"
+        )
+
+    if "select * interdit" in txt or "select *" in r:
+        return "❌ Pour des raisons de sécurité, je ne peux pas faire « SELECT * ». Précise les infos voulues (ex: montant, date, type)."
+
+    if "tenant scope" in txt or "entreprise_id manquant" in r or "filtre entreprise_id manquant" in r:
+        return (
+            "❌ Je ne peux pas exécuter cette demande car elle n’est pas rattachée à une entreprise.\n"
+            "👉 Précise l’entreprise ou le projet (ex: « pour Orionis France » / « pour le projet Chatbot WhatsApp »)."
+        )
+
+    if "rbac" in txt or "non autorisé" in txt or "non autorisé" in r:
+        return "❌ Accès refusé. Ton rôle ne permet pas cette action."
+
+    if "utilisateur inconnu" in r or "numero_whatsapp" in r:
+        return "❌ Accès refusé. Ton numéro WhatsApp n’est pas enregistré."
+
+    # --- Cas business (tu l’as déjà côté executor)
+    if "budget" in txt or "budget" in r:
+        return (
+            "❌ Dépassement de budget.\n"
+            "👉 Réduis le montant, change de projet, ou augmente le budget."
+        )
+
+    if "solde insuffisant" in txt or "solde insuffisant" in r:
+        return "❌ Solde insuffisant sur le compte choisi. Change de compte ou réduis le montant."
+
+    if "devise" in txt and "compte" in txt:
+        # ex: “Transfert impossible en USD. Le compte source est en AED”
+        return raw if raw else "❌ Devise incompatible avec le compte. Reformule avec la devise du compte."
+
+    # --- DB indispo
+    if "db_unavailable" in txt or "could not connect" in txt or "connection refused" in txt:
+        return "⚠️ Service indisponible pour le moment. Réessaie dans quelques minutes."
+
+    # --- Fallback propre
+    return "❌ Je n’ai pas pu traiter la demande. Reformule et réessaie."
 
 # =========================================================
 # Helpers - HTTP calls
@@ -288,6 +373,8 @@ def call_text2sql_continue(user_input: str, pending_plan: Dict[str, Any], contex
         "context": context or {},
     }
     return post_json_allow_400(f"{TEXT2SQL_CONTINUE_URL}/continue", payload)
+
+
 
 
 # =========================================================
@@ -333,7 +420,7 @@ DB_KEYWORDS = [
     "client", "clients",
     "compte", "comptes", "caisse",
     "solde", "budget",
-    "transfert", "transferts",
+    "transfert", "transferts","transfere", "transfère", "transfer", "virement", "virer",
     "entreprise", "bureau",
     "paiement", "paiements",
 ]
@@ -343,6 +430,7 @@ DB_VERBS = [
     "total", "somme", "combien", "top", "moyenne",
     "par mois", "par projet", "par client",
     "aujourd", "cette semaine", "ce mois", "cette année",
+    "transfere", "transfère", "transfer", "virement",
 ]
 
 
@@ -625,8 +713,15 @@ def _simulate_send_message(actor_id: str, original_user_text: str, user_message:
         "user_message": user_message,
         "error_message": error_message,
     }
-    txt = call_response_writer(payload) or (user_message or error_message or "OK")
+    # IMPORTANT: ne pas laisser le writer "inventer" un message d'erreur
+    if error_message:
+        return error_message
+    if user_message:
+        return user_message
+
+    txt = call_response_writer(payload) or "OK"
     return txt
+
 
 
 def _simulate_send_select(actor_id: str, user_text: str, plan: Dict[str, Any], result: Dict[str, Any]) -> str:
@@ -669,44 +764,79 @@ def _simulate_send_write(actor_id: str, user_text: str, plan: Dict[str, Any], re
         "user_message": f"✅ {op} exécuté. affected_rows={result.get('affected_rows')}",
     }
     return call_response_writer(writer_payload) or f"✅ {op} exécuté. affected_rows={result.get('affected_rows')}"
+def post_json_safe(url: str, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+    """
+    Appel HTTP qui ne lève pas d'exception sur 4xx/5xx.
+    Retourne (status_code, json_or_fallback).
+    """
+    r = requests.post(url, json=payload, timeout=TIMEOUT_S)
+    try:
+        data = r.json()
+    except Exception:
+        data = {"detail": {"user_message": "❌ Erreur technique (réponse invalide).", "raw": r.text}}
+    return r.status_code, data
 
 
 def _simulate_execute_plan(actor_id: str, user_text: str, plan: Dict[str, Any]) -> str:
     """
     Guard → Executor → Writer/Fallback => retourne le texte final.
     """
+    ctx = plan.get("context") or {}
+    plan["entreprise_id"] = plan.get("entreprise_id") or ctx.get("entreprise_id")
+    plan["role"] = plan.get("role") or ctx.get("role")
+
     guard = post_json(f"{SQL_GUARD_URL.rstrip('/')}/check", plan)
     if not guard.get("allowed", False):
         reasons = guard.get("reasons") or []
-        return _simulate_send_message(actor_id, user_text, error_message="Requête refusée:\n- " + "\n- ".join(reasons[:6]))
+        return _simulate_send_message(actor_id, user_text, error_message=ux_error_message(user_text, "guard", reasons=reasons))
+
 
     exec_payload = dict(plan)
     exec_payload["sql"] = guard.get("normalized_sql") or plan.get("sql")
     exec_payload["params"] = guard.get("normalized_params") or plan.get("params", [])
 
-    result = post_json(f"{SQL_EXECUTOR_URL.rstrip('/')}/execute", exec_payload)
-    if result.get("status") != "executed":
-        reasons = result.get("reasons") or []
-        return _simulate_send_message(
-            actor_id,
-            user_text,
-            error_message=f"Non exécuté ({result.get('status')}).\n" + ("\n".join(reasons) if reasons else "")
-        )
+    status_code, resp = post_json_safe(f"{SQL_EXECUTOR_URL.rstrip('/')}/execute", exec_payload)
 
-    op = (result.get("operation") or plan.get("operation") or "").upper()
-    if op == "SELECT":
-        return _simulate_send_select(actor_id, user_text, plan, result)
-    return _simulate_send_write(actor_id, user_text, plan, result)
+    # ✅ Cas OK
+    if 200 <= status_code < 300:
+        result = resp
+        if result.get("status") != "executed":
+            reasons = result.get("reasons") or []
+            return _simulate_send_message(
+                actor_id,
+                user_text,
+                error_message=f"Non exécuté ({result.get('status')}).\n" + ("\n".join(reasons) if reasons else "")
+            )
+
+        op = (result.get("operation") or plan.get("operation") or "").upper()
+        if op == "SELECT":
+            return _simulate_send_select(actor_id, user_text, plan, result)
+        return _simulate_send_write(actor_id, user_text, plan, result)
+
+    # ❌ Cas erreur (ex: 409 budget dépassé)
+    detail = resp.get("detail", resp)
+    if isinstance(detail, dict) and detail.get("user_message"):
+        return _simulate_send_message(actor_id, user_text, error_message=detail["user_message"])
+
+    return _simulate_send_message(actor_id, user_text, error_message="❌ Erreur lors de l’exécution. Modifie la demande et réessaie.")
+
 
 
 def _simulate_run_pipeline(actor_id: str, user_text: str) -> str:
     """
     Version sync de _run_pipeline: Text2SQL → Clarification? → Confirmation? → Execute
     """
-    convert_payload = {"user_input": user_text, "actor_id": actor_id}
+    base_ctx = _user_ctx_get(actor_id)
+    convert_payload = {
+        "user_input": user_text,
+        "actor_id": actor_id,
+        "entreprise_id": base_ctx.get("entreprise_id"),
+        "role": base_ctx.get("role"),
+    }
+
     plan, err = post_json_allow_400(f"{TEXT2SQL_URL.rstrip('/')}/convert", convert_payload)
     if err:
-        return _simulate_send_message(actor_id, user_text, error_message=f"Requête refusée (Text2SQL): {err}")
+        return _simulate_send_message(actor_id, user_text, error_message=ux_error_message(user_text, "text2sql", raw=err))
 
     clarification = plan.get("clarification") or {}
     if clarification.get("needed"):
@@ -736,6 +866,8 @@ def simulate(payload: SimulateIn):
     # Security prefilter (same as webhook)
     if SQL_INJECTION_MARKERS_RE.search(user_text):
         return {"reply": "❌ Requête refusée : caractères SQL non autorisés détectés (;, --, /* */). Reformule sans symboles SQL."}
+    if SQL_KEYWORDS_RE.search(user_text):
+        return {"reply": "❌ SQL brut interdit. Reformule en langage naturel."}
 
     # 0) Clarification flow
     clarify = _clarify_get(actor_id)
@@ -762,29 +894,59 @@ def simulate(payload: SimulateIn):
             choice = int(m.group(1))
             selected = next((s for s in suggestions if int(s.get("option", -1)) == choice), None)
             if not selected:
-                return {"reply": "Choix invalide. Réponds avec un numéro de la liste, ou RETOUR."}
+                return {"reply": "Choix invalide. Réponds avec un numéro de la liste, ou Annuler."}
 
+            # ---- IMPORTANT : on fait comme WhatsApp -> /continue ----
             plan = clarify.get("plan") or {}
-            field = clarify.get("field") or "resolved_id"
+            pending_plan = clarify.get("pending_plan") or {}
+            ctx = dict(clarify.get("context") or {})
+            field = clarify.get("field") or ""
             original_text = clarify.get("original_text") or ""
 
+            # last_field sert à Text2SQL pour savoir quoi remplir
+            ctx["last_field"] = field
+            ctx["original_user_input"] = ctx.get("original_user_input") or original_text
+            ctx["user_input"] = user_text
+
+            # valeur envoyée à /continue (ID pour entités, nom pour enums)
+            if field in ("entreprise_id", "projet_id", "compte_id", "client_id", "compte_source_id", "compte_destination_id"):
+                user_value = str(selected.get("id"))
+            else:
+                user_value = str(selected.get("nom"))
+
+
+
+            plan2, err = call_text2sql_continue(
+                user_input=user_value,
+                pending_plan=pending_plan,
+                context=ctx,
+            )
+            if plan2 and isinstance(plan2, dict):
+                _user_ctx_merge(actor_id, plan2.get("context") or {})
+            if err:
+                _clarify_clear(actor_id)
+                return {"reply": f"Requête refusée (Text2SQL/continue): {err}"}
+
+            clar2 = plan2.get("clarification") or {}
+            if clar2.get("needed"):
+                _clarify_update(actor_id, plan2, original_text)
+                stt = _clarify_get(actor_id) or {}
+                msg = _format_clarification_message(stt)
+                return {"reply": msg}
+                        # ✅ Clarification terminée -> on sort du mode clarification
             _clarify_clear(actor_id)
 
-            try:
-                patched_plan = apply_choice_to_plan(plan, field, selected)
+            # ✅ Si write => confirmation
+            if plan_needs_confirmation(plan2):
+                _pending_set(actor_id, plan2, original_text)
+                return {"reply": build_confirmation_message(plan2)}
 
-                if plan_needs_confirmation(patched_plan):
-                    _pending_set(actor_id, patched_plan, original_text)
-                    return {"reply": build_confirmation_message(patched_plan)}
+            # ✅ Sinon exécution directe
+            reply = _simulate_execute_plan(actor_id, original_text, plan2)
+            return {"reply": reply}
 
-                reply = _simulate_execute_plan(actor_id, original_text, patched_plan)
-                return {"reply": reply}
-            except Exception as e:
-                return {"reply": f"❌ Erreur interne: {e}"}
 
-        # Si pas de suggestions => toute réponse = précision, on relance pipeline
-        _clarify_clear(actor_id)
-        return {"reply": _simulate_run_pipeline(actor_id, user_text)}
+
 
     # 1) Confirmation flow
     pending = _pending_get(actor_id)
@@ -890,10 +1052,11 @@ def whatsapp_webhook(
 
                     # Pour les entités (projet/compte), on passe l'ID directement
                     # Pour les enums (type_depense/devise), on passe le nom choisi
-                    if field in ("projet_id", "compte_id", "client_id"):
+                    if field in ("entreprise_id", "projet_id", "compte_id", "client_id", "compte_source_id", "compte_destination_id"):
                         user_value = str(selected.get("id"))
                     else:
                         user_value = str(selected.get("nom"))
+
 
                 else:
                     # Si suggestions existent mais user n'a pas répondu un numéro
@@ -907,6 +1070,8 @@ def whatsapp_webhook(
                     pending_plan=pending_plan,
                     context=ctx,
                 )
+                if plan2 and isinstance(plan2, dict):
+                    _user_ctx_merge(actor_id, plan2.get("context") or {})
                 if err:
                     _send_user_message(actor_id, original_text, error_message=f"Requête refusée (Text2SQL/continue): {err}")
                     _clarify_clear(actor_id)
@@ -1001,10 +1166,16 @@ def _run_pipeline(actor_id: str, user_text: str, original_user_text: str) -> Non
     Text2SQL(/convert) → (Clarification?) → Confirmation? → Guard → Executor → Writer
     """
     try:
-        convert_payload = {"user_input": user_text, "actor_id": actor_id}
+        base_ctx = _user_ctx_get(actor_id)
+        convert_payload = {
+            "user_input": user_text,
+            "actor_id": actor_id,
+            "entreprise_id": base_ctx.get("entreprise_id"),
+            "role": base_ctx.get("role"),
+        }
         plan, err = post_json_allow_400(f"{TEXT2SQL_URL}/convert", convert_payload)
         if err:
-            _send_user_message(actor_id, original_user_text, error_message=f"Requête refusée (Text2SQL): {err}")
+            _send_user_message(actor_id, original_user_text, error_message=ux_error_message(original_user_text, "text2sql", raw=err))
             return
 
         clarification = plan.get("clarification") or {}
@@ -1026,23 +1197,48 @@ def _run_pipeline(actor_id: str, user_text: str, original_user_text: str) -> Non
 
 
 def _execute_plan(actor_id: str, user_text: str, plan: Dict[str, Any]) -> None:
+    ctx = plan.get("context") or {}
+    plan["entreprise_id"] = plan.get("entreprise_id") or ctx.get("entreprise_id")
+    plan["role"] = plan.get("role") or ctx.get("role")
+
     guard = post_json(f"{SQL_GUARD_URL.rstrip('/')}/check", plan)
     if not guard.get("allowed", False):
         reasons = guard.get("reasons") or []
-        _send_user_message(actor_id, user_text, error_message="Requête refusée:\n- " + "\n- ".join(reasons[:6]))
+        msg = ux_error_message(user_text, source="guard", reasons=reasons)
+        _send_user_message(actor_id, user_text, error_message=msg)
         return
 
     exec_payload = dict(plan)
     exec_payload["sql"] = guard.get("normalized_sql") or plan.get("sql")
     exec_payload["params"] = guard.get("normalized_params") or plan.get("params", [])
 
-    result = post_json(f"{SQL_EXECUTOR_URL.rstrip('/')}/execute", exec_payload)
-    if result.get("status") != "executed":
-        reasons = result.get("reasons") or []
-        _send_user_message(actor_id, user_text, error_message=f"Non exécuté ({result.get('status')}).\n" + ("\n".join(reasons) if reasons else ""))
+    status_code, resp = post_json_safe(f"{SQL_EXECUTOR_URL.rstrip('/')}/execute", exec_payload)
+
+    # ✅ succès
+    if 200 <= status_code < 300:
+        result = resp
+        if result.get("status") != "executed":
+            reasons = result.get("reasons") or []
+            _send_user_message(
+                actor_id,
+                user_text,
+                error_message=f"Non exécuté ({result.get('status')}).\n" + ("\n".join(reasons) if reasons else "")
+            )
+            return
+
+        _send_result_via_writer(actor_id, user_text, plan, result)
+        _user_ctx_clear(actor_id)
         return
 
-    _send_result_via_writer(actor_id, user_text, plan, result)
+    # ❌ erreur (ex: 409 budget dépassé)
+    detail = resp.get("detail", resp)
+    if isinstance(detail, dict) and detail.get("user_message"):
+        _send_user_message(actor_id, user_text, error_message=detail["user_message"])
+        return
+
+    # fallback sans fuite technique
+    _send_user_message(actor_id, user_text, error_message="❌ Erreur lors de l’exécution. Modifie la demande et réessaie.")
+
 
 
 # =========================================================
@@ -1061,8 +1257,17 @@ def _send_user_message(actor_id: str, original_user_text: str, user_message: Opt
         "user_message": user_message,
         "error_message": error_message,
     }
-    txt = call_response_writer(payload) or (user_message or error_message or "OK")
+    if error_message:
+        send_whatsapp_via_twilio(actor_id, error_message)
+        return
+    if user_message:
+        send_whatsapp_via_twilio(actor_id, user_message)
+        return
+
+    # fallback writer seulement si pas de message explicite
+    txt = call_response_writer(payload) or "OK"
     send_whatsapp_via_twilio(actor_id, txt)
+
 
 
 def _send_result_via_writer(actor_id: str, user_text: str, plan: Dict[str, Any], result: Dict[str, Any]) -> None:
