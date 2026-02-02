@@ -38,6 +38,7 @@ TEXT2SQL_STUB_LLM = os.getenv("TEXT2SQL_STUB_LLM", "0") == "1"
 
 SCHEMA_REFRESH_SECONDS = int(os.getenv("SCHEMA_REFRESH_SECONDS", "60"))
 TEXT2SQL_SOFT_SCHEMA_FAIL = os.getenv("TEXT2SQL_SOFT_SCHEMA_FAIL", "1") == "1"
+TEXT2SQL_ANALYTICS_FROM_LLM = os.getenv("TEXT2SQL_ANALYTICS_FROM_LLM", "1") == "1"
 
 # Allowlist
 DEFAULT_ALLOWED_TABLES = [
@@ -147,6 +148,18 @@ def detect_lang(user_input: str) -> str:
     fr = sum(1 for w in LANG_FR_HINTS if w in t)
     en = sum(1 for w in LANG_EN_HINTS if w in t)
     return "fr" if fr >= en else "en"
+
+import unicodedata
+def norm_txt(s: str) -> str:
+    s = (s or "").strip().lower()
+    # tirets & apostrophes fréquents WhatsApp
+    s = s.replace("’", "'").replace("–", "-").replace("—", "-")
+    # enlève accents
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    # compacte espaces
+    s = re.sub(r"\s+", " ", s)
+    return s
 # =========================================================
 # Analytics canonical SQL (bypass LLM when possible) — extended
 # =========================================================
@@ -206,6 +219,12 @@ ANALYTICS_TOP_CLIENTS_CA_RE = re.compile(
     r"\b(top)\s*(\d{1,3})?\b.*\b(client|clients|customer|customers)\b.*\b(ca|chiffre d'affaires|chiffre d’affaires|revenue|revenu)\b",
     re.I
 )
+
+ANALYTICS_INVOICES_ISSUED_TOTAL_MONTH_RE = re.compile(
+    r"\b(total|somme)\b.*\b(facture|factures|invoice|invoices)\b.*\b(émis|emise|émises|emises|issued)\b.*\b(ce mois|this month)\b",
+    re.I
+)
+
 
 def _extract_year(text: str):
     m = re.search(r"\b(20\d{2})\b", text or "")
@@ -535,6 +554,31 @@ def try_analytics_bypass_sql(user_input: str, entreprise_id: int | None) -> dict
             "params": [entreprise_id],
         }
 
+    # (X) Total des factures émises ce mois-ci (par devise)
+    if ANALYTICS_INVOICES_ISSUED_TOTAL_MONTH_RE.search(ui):
+        if entreprise_id is None:
+            return None
+        return {
+            "mode": "sql",
+            "operation": "SELECT",
+            "sql": """
+                SELECT
+                f.devise,
+                COUNT(*) AS nb_factures,
+                COALESCE(SUM(f.montant), 0) AS total_emis
+                FROM facture f
+                JOIN projet p ON p.id = f.projet_id
+                WHERE p.entreprise_id = %s
+                AND f.date_emission >= date_trunc('month', current_date)
+                AND f.date_emission <  (date_trunc('month', current_date) + interval '1 month')
+                AND f.statut = 'EMISE'
+                GROUP BY f.devise
+                ORDER BY f.devise;
+            """.strip(),
+            "params": [entreprise_id],
+        }
+
+
     return None
 
 # =========================================================
@@ -633,7 +677,7 @@ class LLMPlan(BaseModel):
     mode: str = Field(pattern=r"^plan$")
     operation: str
     intent: str
-    entities: Dict[str, Optional[str]] = Field(default_factory=dict)
+    entities: Dict[str, Optional[Union[str, int, float]]] = Field(default_factory=dict)
     sql_template: str
     template_params: List[Any] = Field(default_factory=list)
 
@@ -844,9 +888,33 @@ def extract_columns(node: exp.Expression) -> List[Tuple[Optional[str], str]]:
 
 
 def has_select_star(node: exp.Expression) -> bool:
-    if not isinstance(node, exp.Select):
-        node = node.find(exp.Select) or node
-    return any(True for _ in node.find_all(exp.Star))
+    """
+    True uniquement si la projection contient SELECT * (ou table.*).
+    False pour COUNT(*) / JSON_BUILD_OBJECT('*') etc.
+    """
+    select = node if isinstance(node, exp.Select) else (node.find(exp.Select) or node)
+    if not isinstance(select, exp.Select):
+        return False
+
+    for proj in (select.expressions or []):
+        # SELECT *
+        if isinstance(proj, exp.Star):
+            return True
+
+        # SELECT t.*  (sqlglot représente souvent ça aussi comme Star avec table)
+        if isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star):
+            return True
+
+        # SELECT * AS ...
+        if isinstance(proj, exp.Alias) and isinstance(proj.this, exp.Star):
+            return True
+
+        # SELECT t.* AS ...
+        if isinstance(proj, exp.Alias) and isinstance(proj.this, exp.Column) and isinstance(proj.this.this, exp.Star):
+            return True
+
+    return False
+
 
 
 def has_limit(node: exp.Expression) -> bool:
@@ -1346,14 +1414,151 @@ INTENTS: Dict[str, Dict[str, Any]] = {
 
 }
 
+# =========================================================
+# Analytics intents (SQL canonique, pas de SQL écrit par LLM)
+# =========================================================
+INTENTS.update({
+    "ANALYTICS_DEPENSE_TOTAL_MONTH": {
+        "operation": "SELECT",
+        "table": "depense",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT d.devise, COALESCE(SUM(d.montant), 0) AS total
+            FROM depense d
+            JOIN projet p ON p.id = d.projet_id
+            WHERE p.entreprise_id = %s
+              AND d.date_depense >= date_trunc('month', current_date)
+              AND d.date_depense <  (date_trunc('month', current_date) + interval '1 month')
+            GROUP BY d.devise
+            ORDER BY d.devise;
+        """.strip(),
+    },
+
+    "ANALYTICS_TRANSFERT_TOTAL_MONTH": {
+        "operation": "SELECT",
+        "table": "transfert_interne",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT ti.devise, COALESCE(SUM(ti.montant), 0) AS total
+            FROM transfert_interne ti
+            JOIN compte_financier src ON src.id = ti.compte_source_id
+            WHERE src.entreprise_id = %s
+              AND ti.date_transfert >= date_trunc('month', current_date)
+              AND ti.date_transfert <  (date_trunc('month', current_date) + interval '1 month')
+            GROUP BY ti.devise
+            ORDER BY ti.devise;
+        """.strip(),
+    },
+
+    "ANALYTICS_TRANSFERT_LIST_MONTH": {
+        "operation": "SELECT",
+        "table": "transfert_interne",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT
+              ti.id,
+              ti.date_transfert,
+              ti.montant,
+              ti.devise,
+              src.nom AS compte_source,
+              dst.nom AS compte_destination
+            FROM transfert_interne ti
+            JOIN compte_financier src ON src.id = ti.compte_source_id
+            JOIN compte_financier dst ON dst.id = ti.compte_destination_id
+            WHERE src.entreprise_id = %s
+              AND ti.date_transfert >= date_trunc('month', current_date)
+              AND ti.date_transfert <  (date_trunc('month', current_date) + interval '1 month')
+            ORDER BY ti.date_transfert DESC, ti.id DESC;
+        """.strip(),
+    },
+
+    "ANALYTICS_DEPENSE_BREAKDOWN_TYPE_MONTH": {
+        "operation": "SELECT",
+        "table": "depense",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT d.type_depense, d.devise, COUNT(*) AS nb, COALESCE(SUM(d.montant), 0) AS total
+            FROM depense d
+            JOIN projet p ON p.id = d.projet_id
+            WHERE p.entreprise_id = %s
+              AND d.date_depense >= date_trunc('month', current_date)
+              AND d.date_depense <  (date_trunc('month', current_date) + interval '1 month')
+            GROUP BY d.type_depense, d.devise
+            ORDER BY total DESC;
+        """.strip(),
+    },
+
+    "ANALYTICS_ACCOUNT_BALANCES": {
+        "operation": "SELECT",
+        "table": "compte_financier",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT cf.id, cf.nom, cf.devise, cf.solde
+            FROM compte_financier cf
+            WHERE cf.entreprise_id = %s
+            ORDER BY cf.nom;
+        """.strip(),
+    },
+
+    "ANALYTICS_UNPAID_INVOICES": {
+        "operation": "SELECT",
+        "table": "facture",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT
+              c.id AS client_id,
+              c.nom AS client,
+              p.id AS projet_id,
+              p.nom AS projet,
+              f.devise,
+              COUNT(*) AS nb_factures,
+              COALESCE(SUM(f.montant), 0) AS total_du
+            FROM facture f
+            JOIN projet p ON p.id = f.projet_id
+            JOIN client c ON c.id = f.client_id
+            WHERE p.entreprise_id = %s
+              AND f.statut <> 'PAYEE'
+            GROUP BY c.id, c.nom, p.id, p.nom, f.devise
+            ORDER BY total_du DESC;
+        """.strip(),
+    },
+})
+
+INTENTS.update({
+  "ANALYTICS_INVOICES_ISSUED_TOTAL_MONTH": {
+    "operation": "SELECT",
+    "table": "facture",
+    "required": ["entreprise_id"],
+    "template": """
+      SELECT
+        f.devise,
+        COUNT(*) AS nb_factures,
+        COALESCE(SUM(f.montant), 0) AS total_emis
+      FROM facture f
+      JOIN projet p ON p.id = f.projet_id
+      WHERE p.entreprise_id = %s
+        AND f.date_emission >= date_trunc('month', current_date)
+        AND f.date_emission <  (date_trunc('month', current_date) + interval '1 month')
+        AND f.statut = 'EMISE'
+      GROUP BY f.devise
+      ORDER BY f.devise;
+    """.strip(),
+  },
+})
 
 # =========================================================
 # Few-shot (extended: depense + facture + transfert)
 # =========================================================
 FEW_SHOT_BY_LANG = {
     "fr": [
-        {"nl": "Liste des projets", "out": {"mode": "sql", "operation": "SELECT",
-                                            "sql": "SELECT p.id, p.nom FROM projet p ORDER BY p.nom;", "params": []}},
+        {"nl": "Liste les projets", "out": {
+            "mode":"plan",
+            "operation":"SELECT",
+            "intent":"SELECT_PROJECTS",
+            "entities": {},
+            "sql_template": INTENTS["SELECT_PROJECTS"]["template"],
+            "template_params": []
+            }},
         {"nl": "Ajoute une dépense de 50€ pour le projet Migration depuis le compte principal",
          "out": {
              "mode": "plan",
@@ -1381,6 +1586,15 @@ FEW_SHOT_BY_LANG = {
              "sql_template": INTENTS["INSERT_TRANSFERT"]["template"],
              "template_params": [5000, "EUR"]
          }},
+         {"nl": "Total des factures émises ce mois-ci", "out": {
+            "mode": "plan",
+            "operation": "SELECT",
+            "intent": "ANALYTICS_INVOICES_ISSUED_TOTAL_MONTH",
+            "entities": {},
+            "sql_template": "",
+            "template_params": []
+        }},
+
     ],
     "en": [
         {"nl": "List projects", "out": {"mode": "sql", "operation": "SELECT",
@@ -1388,6 +1602,32 @@ FEW_SHOT_BY_LANG = {
     ]
 }
 
+FEW_SHOT_BY_LANG["fr"] += [
+    {"nl": "Total des dépenses ce mois-ci", "out": {
+        "mode": "plan",
+        "operation": "SELECT",
+        "intent": "ANALYTICS_DEPENSE_TOTAL_MONTH",
+        "entities": {},
+        "sql_template": "",
+        "template_params": []
+    }},
+    {"nl": "Répartition des dépenses par type ce mois", "out": {
+        "mode": "plan",
+        "operation": "SELECT",
+        "intent": "ANALYTICS_DEPENSE_BREAKDOWN_TYPE_MONTH",
+        "entities": {},
+        "sql_template": "",
+        "template_params": []
+    }},
+    {"nl": "Montre les soldes des comptes", "out": {
+        "mode": "plan",
+        "operation": "SELECT",
+        "intent": "ANALYTICS_ACCOUNT_BALANCES",
+        "entities": {},
+        "sql_template": "",
+        "template_params": []
+    }},
+]
 
 def build_schema_summary(schema_bundle: Dict[str, Any]) -> Dict[str, Any]:
     tables = schema_bundle["tables"]
@@ -1419,7 +1659,6 @@ def build_llm_prompt(user_input: str, context: Dict[str, Any], force_plan: bool)
         "ALLOWLIST": "Tables: uniquement allowlist",
         "NO_STAR": "Interdit: SELECT *",
         "LIMIT_RULE": "Si l'utilisateur demande explicitement un top N / N dernières / N plus grandes, tu DOIS mettre LIMIT N. Sinon, tu NE mets PAS de LIMIT (le système injectera un LIMIT par défaut).",
-        "NO_LIMIT": "Interdit: LIMIT sauf si demandé explicitement",
         "PLACEHOLDERS": "Placeholders: %s uniquement",
     }
 
@@ -1429,6 +1668,15 @@ def build_llm_prompt(user_input: str, context: Dict[str, Any], force_plan: bool)
         "INSERT_FACTURE": INTENTS["INSERT_FACTURE"]["template"],
         "INSERT_TRANSFERT": INTENTS["INSERT_TRANSFERT"]["template"],
     }
+    analytics_intents = [
+        "ANALYTICS_DEPENSE_TOTAL_MONTH",
+        "ANALYTICS_TRANSFERT_TOTAL_MONTH",
+        "ANALYTICS_TRANSFERT_LIST_MONTH",
+        "ANALYTICS_DEPENSE_BREAKDOWN_TYPE_MONTH",
+        "ANALYTICS_ACCOUNT_BALANCES",
+        "ANALYTICS_UNPAID_INVOICES","ANALYTICS_INVOICES_ISSUED_TOTAL_MONTH",
+    ]
+
 
     return f"""
 Tu es un assistant Text2SQL STRICT pour PostgreSQL.
@@ -1443,7 +1691,6 @@ RÈGLES:
 - {rules["ALLOWLIST"]}
 - {rules["NO_STAR"]}
 - {rules["LIMIT_RULE"]}
-- {rules["NO_LIMIT"]}
 - {rules["PLACEHOLDERS"]}
 
 INTENTS D'ÉCRITURE (IMPORTANT):
@@ -1456,6 +1703,26 @@ CONTRAINTES SCHÉMA (IMPORTANT):
 - facture exige: projet_id, client_id, montant, devise, statut, date_emission. (date_paiement optionnelle)
 - transfert_interne exige: compte_source_id, compte_destination_id, montant, devise, date_transfert.
 - Si une info manque: retourne PLAN avec entities.* à null + sql_template canonique.
+
+INTENTS & DÉTECTION:
+- Si l'utilisateur veut AJOUTER/INSÉRER une dépense -> intent=INSERT_DEPENSE (PLAN)
+- Si l'utilisateur veut CRÉER une facture -> intent=INSERT_FACTURE (PLAN)
+- Si l'utilisateur veut FAIRE un transfert interne -> intent=INSERT_TRANSFERT (PLAN)
+- Si l'utilisateur demande un indicateur / résumé / total / répartition / solde / impayés -> intent ANALYTICS (PLAN)
+  Intents analytics autorisés:
+  - {{", ".join(analytics_intents)}}
+
+IMPORTANT:
+- Pour les intents ANALYTICS_* : tu retournes TOUJOURS un PLAN (operation=SELECT).
+- Pour les intents ANALYTICS_* : tu NE DOIS PAS produire de SQL (sql_template="" et template_params=[]).
+- Si la question correspond à un indicateur (total/répartition/solde/impayés/factures émises),
+  tu DOIS choisir un intent ANALYTICS_* parmi la liste autorisée ci-dessous.
+- Ne retourne JAMAIS mode="sql" pour une analytics.
+- Ne retourne JAMAIS intent="AUTRE" pour une analytics.
+- Si l'entreprise n'est pas connue/ambigue (entreprise_id absent), retourne quand même le PLAN analytics:
+      "entities":{{}}, et laisse le backend demander entreprise_id via clarification (ne demande pas "info").
+
+
 
 TEMPLATES CANONIQUES:
 {json.dumps(templates, ensure_ascii=False)}
@@ -1481,19 +1748,30 @@ PLAN:
 {{
   "mode":"plan",
   "operation":"SELECT|INSERT|UPDATE|DELETE|UNKNOWN",
-  "intent":"INSERT_DEPENSE|INSERT_FACTURE|INSERT_TRANSFERT|AUTRE",
-  "entities":{{
-    "projet_query": null|"...",
-    "client_query": null|"...",
-    "compte_query": null|"...",
-    "compte_source_query": null|"...",
-    "compte_destination_query": null|"...",
-    "type_depense": null|"..."
-  }},
-  "sql_template":"SQL avec %s",
+  "intent":"INSERT_DEPENSE|INSERT_FACTURE|INSERT_TRANSFERT|SELECT_PROJECTS|ANALYTICS_*|AUTRE",
+  "entities":{{ ... }},
+  "sql_template":"SQL avec %s OU vide si ANALYTICS_*",
   "template_params":[]
 }}
 """.strip()
+
+def detect_analytics_intent(user_input: str) -> Optional[str]:
+    ui = norm_txt(user_input)
+    if ANALYTICS_INVOICES_ISSUED_TOTAL_MONTH_RE.search(ui):
+        return "ANALYTICS_INVOICES_ISSUED_TOTAL_MONTH"
+    if ANALYTICS_UNPAID_INVOICES_RE.search(ui):
+        return "ANALYTICS_UNPAID_INVOICES"
+    if ANALYTICS_DEPENSE_TOTAL_MONTH_RE.search(ui):
+        return "ANALYTICS_DEPENSE_TOTAL_MONTH"
+    if ANALYTICS_DEPENSE_BREAKDOWN_TYPE_MONTH_RE.search(ui):
+        return "ANALYTICS_DEPENSE_BREAKDOWN_TYPE_MONTH"
+    if ANALYTICS_ACCOUNT_BALANCES_RE.search(ui):
+        return "ANALYTICS_ACCOUNT_BALANCES"
+    if ANALYTICS_TRANSFERT_TOTAL_MONTH_RE.search(ui):
+        return "ANALYTICS_TRANSFERT_TOTAL_MONTH"
+    if ANALYTICS_TRANSFERT_LIST_MONTH_RE.search(ui):
+        return "ANALYTICS_TRANSFERT_LIST_MONTH"
+    return None
 
 
 # =========================================================
@@ -1706,12 +1984,27 @@ def continue_pending_plan(
     notes: List[str] = []
     lang = context.get("lang", "fr")
 
+
     if pending.intent == "REPLAY_ORIGINAL_AFTER_TENANT":
         original = context.get("original_user_input") or ""
+
+        # cas spécial: liste les projets
+        if re.search(r"\b(liste|listez|list)\b.*\b(projets?|projects?)\b", original, re.I):
+            sql = INTENTS["SELECT_PROJECTS"]["template"]
+            return sql, [context["entreprise_id"]], {}, Clarification(needed=False), pending, ["replay_select_projects"]
+
         bypass = try_analytics_bypass_sql(original, context.get("entreprise_id"))
         if bypass:
             return bypass["sql"], bypass.get("params", []), {}, Clarification(needed=False), pending, ["replay_original"]
-        return None, [], {}, Clarification(needed=True, entity="info", message="Reformule."), pending, []
+
+        # ✅ IMPORTANT: pas "info" => relancer LLM (sinon tu retombes dans ton bug)
+        
+        return None, [], {}, Clarification(
+            needed=True,
+            entity="replay",
+            message="REPLAY: relancer /continue sur original_user_input via LLM (pas de fallback info ici)."
+        ), pending, notes
+
 
     # record the answer to the last asked field
     filled = dict(pending.filled or {})
@@ -1785,6 +2078,44 @@ def continue_pending_plan(
         params = [eid]
 
         notes.append("SELECT_PROJECTS resolved.")
+        return sql, params, {}, Clarification(needed=False), pending, notes
+
+    # -----------------------------------------------------
+    # INTENTS: ANALYTICS_* (NEW) — SQL canonique backend
+    # -----------------------------------------------------
+    if intent and intent.startswith("ANALYTICS_"):
+        eid = context.get("entreprise_id") or filled.get("entreprise_id")
+        if not eid:
+            uid = context.get("user_id")
+            if uid:
+                ents = list_user_enterprises(int(uid))
+                return None, [], {}, _clarify_pick("entreprise", "", ents, lang), pending, notes
+
+            return None, [], {}, Clarification(
+                needed=True,
+                entity="entreprise",
+                field="entreprise_id",
+                query="",
+                suggestions=[],
+                message=t(lang, "need_entreprise"),
+            ), pending, notes
+
+        eid = int(eid)
+        context["entreprise_id"] = eid
+        pending.filled["entreprise_id"] = eid
+
+        meta = INTENTS.get(intent)
+        if not meta:
+            return None, [], {}, Clarification(
+                needed=True,
+                entity="info",
+                message=f"Intent analytics inconnu: {intent}. Reformule.",
+            ), pending, notes
+
+        sql = (meta.get("template") or "").strip()
+        params = [eid]
+
+        notes.append(f"{intent} resolved.")
         return sql, params, {}, Clarification(needed=False), pending, notes
 
     # -----------------------------------------------------
@@ -2202,6 +2533,7 @@ def continue_pending_plan(
     # -----------------------------------------------------
     # Fallback: intent not supported
     # -----------------------------------------------------
+    
     return None, [], {}, Clarification(
         needed=True,
         entity="info",
@@ -2300,29 +2632,58 @@ def convert(req: ConvertRequest):
     # =========================================================
     # Analytics bypass (avoid LLM hallucinations)
     # =========================================================
-    bypass = try_analytics_bypass_sql(req.user_input, context.get("entreprise_id"))
-    if bypass:
-        llm_obj = bypass
+    ui = norm_txt(req.user_input)
+    analytics_intent = detect_analytics_intent(ui)
+    log_event(
+    "analytics_detect",
+    request_id=request_id,
+    raw=req.user_input,
+    normalized=norm_txt(req.user_input),
+    analytics_intent=analytics_intent,
+    channel=context.get("channel"),
+)
+
+    if analytics_intent:
+        llm_obj = {
+            "mode": "plan",
+            "operation": "SELECT",
+            "intent": analytics_intent,
+            "entities": {},
+            "sql_template": "",
+            "template_params": [],
+        }
         llm_ms = 0
     else:
-        t0 = time.time()
-        if TEXT2SQL_STUB_LLM:
-            llm_obj = {
-                "mode": "sql",
-                "operation": "SELECT",
-                "sql": "SELECT p.id, p.nom FROM projet p ORDER BY p.nom;",
-                "params": [],
-            }
+        bypass = try_analytics_bypass_sql(req.user_input, context.get("entreprise_id"))
+
+        if bypass:
+            llm_obj = bypass
+            llm_ms = 0
         else:
-            prompt = build_llm_prompt(req.user_input, context, force_plan=force_plan)
-            llm_obj = call_gpt(prompt)
-        llm_ms = int((time.time() - t0) * 1000)
+            t0 = time.time()
+            if TEXT2SQL_STUB_LLM:
+                llm_obj = {
+                    "mode": "sql",
+                    "operation": "SELECT",
+                    "sql": "SELECT p.id, p.nom FROM projet p ORDER BY p.nom;",
+                    "params": [],
+                }
+            else:
+                prompt = build_llm_prompt(req.user_input, context, force_plan=force_plan)
+                llm_obj = call_gpt(prompt)
+            llm_ms = int((time.time() - t0) * 1000)
 
     try:
         llm: LLMOutput = parse_llm_output(llm_obj)
     except (ValidationError, Exception) as e:
-        log_event("llm_output_invalid", request_id=request_id, error=str(e))
-        raise HTTPException(400, f"Sortie LLM invalide: {e}")
+        log_event(
+            "llm_output_invalid",
+            request_id=request_id,
+            error=str(e),
+            llm_obj=llm_obj,   # 🔥 essentiel
+        )
+        raise HTTPException(400, "Sortie LLM invalide")
+
 
     mode = llm.mode.lower()
 
@@ -2482,7 +2843,7 @@ def convert(req: ConvertRequest):
         tables=tables,
         schema_ok=schema_ok,
         columns_ok=columns_ok,
-        tenant_scoped=tenant_scoped if req.entreprise_id is not None else True,
+        tenant_scoped=tenant_scoped if context.get("entreprise_id") is not None else True,
         needs_approval=needs_approval,
         llm_ms=llm_ms,
         duration_ms=duration_ms,
@@ -2501,7 +2862,7 @@ def convert(req: ConvertRequest):
             ddl_blocked=True,
             schema_ok=schema_ok,
             single_statement=True,
-            tenant_scoped=tenant_scoped if req.entreprise_id is not None else True,
+            tenant_scoped=tenant_scoped if context.get("entreprise_id") is not None else True,
             columns_ok=columns_ok,
             no_select_star=no_select_star_ok,
             limit_ok=limit_ok,
@@ -2555,6 +2916,11 @@ def continue_plan(req: ContinueRequest):
         original = context.get("original_user_input") or ""
         if not original:
             raise HTTPException(400, "original_user_input manquant")
+        log_event(
+    "analytics_bypass_try",
+    request_id=request_id,
+    user_input=req.user_input,
+)
 
         bypass = try_analytics_bypass_sql(original, context.get("entreprise_id"))
         if bypass:

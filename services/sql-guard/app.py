@@ -977,33 +977,21 @@ def check(plan: SQLPlan):
         if op in ("UPDATE", "DELETE") and not has_where_clause(node):
             reasons.append(f"{op} sans WHERE (interdit).")
 
-        if op == "SELECT":
-            if DENY_SELECT_STAR and has_select_star(node):
-                reasons.append("SELECT * interdit.")
+        if op == "SELECT" and not select_has_limit(node):
+            if GUARD_AUTO_LIMIT:
+                requested = extract_requested_limit(plan.user_input)
+                limit = GUARD_MAX_ROWS if requested is None else min(requested, GUARD_MAX_ROWS)
 
-            if not select_has_limit(node):
-                if GUARD_AUTO_LIMIT:
-                    requested = extract_requested_limit(plan.user_input)
-                    limit = GUARD_MAX_ROWS
-                    if requested is not None:
-                        limit = min(requested, GUARD_MAX_ROWS)
+                sql = inject_limit_safe(sql, limit)        # ✅ remplace sql
+                try:
+                    node = parse_sql_single(sql)           # ✅ remplace node
+                    op = ast_operation(node)
+                    tables = extract_tables(node)
+                except Exception as e:
+                    reasons.append(f"SQL invalide après LIMIT auto: {e}")
 
-                    normalized_sql = inject_limit_safe(sql, limit)
-
-
-                    # Re-parse pour confirmer que c’est valide
-                    try:
-                        node2 = parse_sql_single(normalized_sql)
-                        # Optionnel: recalc op/tables depuis la version normalisée
-                        op = ast_operation(node2)
-                        tables = extract_tables(node2)
-                    except Exception as e:
-                        reasons.append(f"SQL invalide après LIMIT auto: {e}")
-
-                    print("SQL_NORM:", repr(normalized_sql))
-                    normalized_params = params
-                else:
-                    reasons.append("SELECT sans LIMIT (interdit).")
+            
+    
 
     # -------------------------
     # (F) Tenant scope enforcement (guard-side)
@@ -1061,6 +1049,11 @@ def check(plan: SQLPlan):
         normalized_params = normalized_params or params
 
     duration_ms = int((time.time() - started) * 1000)
+
+    print("SQL_RECV:", repr(sql))
+    print("USER_INPUT:", repr(plan.user_input))
+    print("CTX:", {k: ctx.get(k) for k in ["entreprise_id","actor_id","role"]})
+
     log_event(
         "guard_check",
         request_id=request_id,
@@ -1070,6 +1063,7 @@ def check(plan: SQLPlan):
         role=role_to_use,
         entreprise_id=entreprise_id,
         duration_ms=duration_ms,
+        reasons=reasons,
         reasons_count=len(reasons),
     )
 

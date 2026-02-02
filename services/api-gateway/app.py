@@ -16,6 +16,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
+from streamlit import json
 
 # =========================================================
 # ENV
@@ -332,6 +333,16 @@ def ux_error_message(user_text: str, source: str, raw: str = "", reasons: Option
     # --- DB indispo
     if "db_unavailable" in txt or "could not connect" in txt or "connection refused" in txt:
         return "⚠️ Service indisponible pour le moment. Réessaie dans quelques minutes."
+
+    if "sql vide" in txt:
+        return (
+            "❌ Je n’ai pas pu générer la requête.\n"
+            "👉 Réessaie en précisant l’entreprise (ex: « pour Orionis France »)."
+        )
+
+    if "limit requis sur select" in txt:
+        return "❌ Requête refusée: LIMIT requis. Reformule en demandant un top N (ex: « 10 dernières factures »)."
+
 
     # --- Fallback propre
     return "❌ Je n’ai pas pu traiter la demande. Reformule et réessaie."
@@ -777,6 +788,7 @@ def post_json_safe(url: str, payload: Dict[str, Any]) -> Tuple[int, Dict[str, An
     return r.status_code, data
 
 
+
 def _simulate_execute_plan(actor_id: str, user_text: str, plan: Dict[str, Any]) -> str:
     """
     Guard → Executor → Writer/Fallback => retourne le texte final.
@@ -866,8 +878,10 @@ def simulate(payload: SimulateIn):
     # Security prefilter (same as webhook)
     if SQL_INJECTION_MARKERS_RE.search(user_text):
         return {"reply": "❌ Requête refusée : caractères SQL non autorisés détectés (;, --, /* */). Reformule sans symboles SQL."}
-    if SQL_KEYWORDS_RE.search(user_text):
+    SQL_DIRECT_RE = re.compile(r"^\s*(select|insert|update|delete|drop|truncate|alter|create)\b", re.I)
+    if SQL_DIRECT_RE.match(user_text):
         return {"reply": "❌ SQL brut interdit. Reformule en langage naturel."}
+
 
     # 0) Clarification flow
     clarify = _clarify_get(actor_id)

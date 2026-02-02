@@ -69,7 +69,7 @@ services:
     env_file:
       - .env
     environment:
-      GUARD_AUTO_LIMIT: "1"
+      GUARD_AUTO_LIMIT: "0"
       GUARD_MAX_ROWS: "200"
     ports:
       - "8002:8000"
