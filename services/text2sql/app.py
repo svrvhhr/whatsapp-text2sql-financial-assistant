@@ -225,6 +225,117 @@ ANALYTICS_INVOICES_ISSUED_TOTAL_MONTH_RE = re.compile(
     re.I
 )
 
+ANALYTICS_DEPENSE_TOTAL_MONTH_BY_PROJECT_RE = re.compile(
+    r"\b(total|somme)\b.*\b(depense|depenses)\b.*\b(ce mois|this month)\b.*\b(par|by)\b.*\b(projet|project)\b"
+    r"|\b(total|somme)\b.*\b(depense|depenses)\b.*\b(par|by)\b.*\b(projet|project)\b.*\b(ce mois|this month)\b",
+    re.I
+)
+
+ANALYTICS_TOPN_PROJECTS_SPEND_MONTH_RE = re.compile(
+    r"\btop\s*(\d{1,3})\b.*\b(projet|projects?)\b.*\b(depense|depenses)\b.*\b(ce mois|this month)\b"
+    r"|\btop\s*(\d{1,3})\b.*\b(depense|depenses)\b.*\b(ce mois|this month)\b.*\b(projet|projects?)\b",
+    re.I
+)
+
+ANALYTICS_LASTN_DEPENSES_PROJECT_RE = re.compile(
+    r"\b(derni[eè]res?|last)\s*(\d{1,3})\b.*\b(depense|depenses)\b.*\b(projet|project)\b",
+    re.I
+)
+
+ANALYTICS_TOPN_CLIENTS_BILLED_YEAR_RE = re.compile(
+    r"\btop\s*(\d{1,3})\b.*\b(clients?)\b.*\b(montant|total)\b.*\b(factur[ée]|billed|invoice)\b.*\b(cette annee|this year)\b",
+    re.I
+)
+
+ANALYTICS_DEPENSE_TOTAL_RE = re.compile(
+    r"\b(total|somme)\b.*\b(dépense|depense|dépenses|depenses)\b(?!.*\b(ce mois|this month)\b)",
+    re.I
+)
+
+ANALYTICS_DEPENSE_BREAKDOWN_TYPE_RE = re.compile(
+    r"\b(répartition|repartition|breakdown)\b.*\b(dépense|depense|dépenses|depenses)\b.*\b(type|catégorie|categorie)\b(?!.*\b(ce mois|this month)\b)",
+    re.I
+)
+
+# Dernières N dépenses (global, sans projet)
+ANALYTICS_LASTN_DEPENSES_RE = re.compile(
+    r"\b(?:"
+    r"(?:derni[eè]res?|last)\s*(\d{1,3})"          # "dernières 5"
+    r"|"
+    r"(\d{1,3})\s*(?:derni[eè]res?|last)"          # "5 dernières"
+    r")\b.*\b(depense|depenses)\b",
+    re.I
+)
+
+
+# Liste des dépenses ce mois-ci
+ANALYTICS_DEPENSE_LIST_MONTH_RE = re.compile(
+    r"\b(depense|depenses)\b.*\b(ce mois|this month)\b",
+    re.I
+)
+
+# Dépenses par compte (mois)
+ANALYTICS_DEPENSE_BY_ACCOUNT_MONTH_RE = re.compile(
+    r"\b(depense|depenses)\b.*\b(par|by)\b.*\b(compte|account)\b.*\b(ce mois|this month)\b",
+    re.I
+)
+
+# Total factures PAYÉES ce mois
+ANALYTICS_INVOICES_PAID_TOTAL_MONTH_RE = re.compile(
+    r"\b(total|somme)\b.*\b(factures?)\b.*\b(pay[ée]es?|paid)\b.*\b(ce mois|this month)\b",
+    re.I
+)
+
+# Total factures PAYÉES (sans période)
+ANALYTICS_INVOICES_PAID_TOTAL_RE = re.compile(
+    r"\b(total|somme)\b.*\b(factures?)\b.*\b(pay[ée]es?|paid)\b",
+    re.I
+)
+
+# Liste des factures impayées (détail)
+ANALYTICS_UNPAID_INVOICES_LIST_RE = re.compile(
+    r"\b(liste|montre|affiche|show|list)\b.*\b(factures?)\b.*\b(impay[ée]es?|unpaid|outstanding)\b",
+    re.I
+)
+
+# Derniers N transferts
+ANALYTICS_LASTN_TRANSFERTS_RE = re.compile(
+    r"\b(derni[eè]rs?|last)\s*(\d{1,3})\b.*\b(transferts?|virements?)\b",
+    re.I
+)
+
+# Logs / audit
+ANALYTICS_AUDIT_LASTN_EVENTS_RE = re.compile(
+    r"\b(derniers?|last)\s*(\d{1,3})?\b.*\b(logs?|audit|events?)\b",
+    re.I
+)
+
+# Utilisateurs + rôles
+ANALYTICS_USERS_ROLES_RE = re.compile(
+    r"\b(utilisateurs?|users?)\b.*\b(r[oô]les?|roles?|permissions?)\b",
+    re.I
+)
+
+ANALYTICS_TRANSFERT_LIST_RE = re.compile(
+    r"\b(liste|montre|affiche|show|list)\b.*\b(transferts?|virements?)\b(?!.*\b(ce mois|this month)\b)",
+    re.I
+)
+
+ANALYTICS_TRANSFERT_TOTAL_RE = re.compile(
+    r"\b(total|somme)\b.*\b(transferts?|virements?)\b(?!.*\b(ce mois|this month)\b)",
+    re.I
+)
+
+ANALYTICS_INVOICES_ISSUED_TOTAL_RE = re.compile(
+    r"\b(total|somme)\b.*\b(factures?)\b.*\b(émis|emise|émises|emises|issued)\b(?!.*\b(ce mois|this month)\b)",
+    re.I
+)
+
+ANALYTICS_INVOICES_LIST_RE = re.compile(
+    r"\b(liste|montre|affiche|show|list)\b.*\b(factures?|invoices?)\b(?!.*\b(impay|unpaid|outstanding|payee|paid|emises|issued|total|somme)\b)",
+    re.I
+)
+
 
 def _extract_year(text: str):
     m = re.search(r"\b(20\d{2})\b", text or "")
@@ -250,8 +361,8 @@ def _extract_project_query(text: str):
 
 
 def try_analytics_bypass_sql(user_input: str, entreprise_id: int | None) -> dict | None:
-    ui = user_input or ""
-
+    ui_raw = user_input or ""
+    ui = norm_txt(ui_raw)
     # (0) Total dépenses ce mois (par devise) — canon
     if ANALYTICS_DEPENSE_TOTAL_MONTH_RE.search(ui):
         if entreprise_id is None:
@@ -1546,6 +1657,417 @@ INTENTS.update({
   },
 })
 
+INTENTS.update({
+    "ANALYTICS_DEPENSE_TOTAL_MONTH_BY_PROJECT": {
+  "operation": "SELECT",
+  "table": "depense",
+  "required": ["entreprise_id"],
+  "template": """
+    SELECT
+      p.id   AS projet_id,
+      p.nom  AS projet,
+      d.devise,
+      COALESCE(SUM(d.montant), 0) AS total_depenses
+    FROM depense d
+    JOIN projet p ON p.id = d.projet_id
+    WHERE p.entreprise_id = %s
+      AND d.date_depense >= date_trunc('month', current_date)
+      AND d.date_depense <  (date_trunc('month', current_date) + interval '1 month')
+    GROUP BY p.id, p.nom, d.devise
+    ORDER BY total_depenses DESC;
+  """.strip(),
+},
+"ANALYTICS_TOP_PROJECTS_BY_SPEND_MONTH": {
+  "operation": "SELECT",
+  "table": "depense",
+  "required": ["entreprise_id"],
+  # IMPORTANT: N sera injecté dans le SQL (pas en %s) car LIMIT ne marche pas toujours bien en param selon ton pipeline.
+  "template": """
+    SELECT
+      p.id   AS projet_id,
+      p.nom  AS projet,
+      d.devise,
+      COALESCE(SUM(d.montant), 0) AS total_depenses
+    FROM depense d
+    JOIN projet p ON p.id = d.projet_id
+    WHERE p.entreprise_id = %s
+      AND d.date_depense >= date_trunc('month', current_date)
+      AND d.date_depense <  (date_trunc('month', current_date) + interval '1 month')
+    GROUP BY p.id, p.nom, d.devise
+    ORDER BY total_depenses DESC
+    LIMIT {topn};
+  """.strip(),
+},
+
+"ANALYTICS_LASTN_DEPENSES_FOR_PROJECT": {
+  "operation": "SELECT",
+  "table": "depense",
+  "required": ["entreprise_id"],  # entreprise_id sert à résoudre projet + sécuriser
+  "template": """
+    SELECT
+      d.id,
+      d.date_depense,
+      d.type_depense,
+      d.montant,
+      d.devise,
+      d.description
+    FROM depense d
+    WHERE d.projet_id = %s
+    ORDER BY d.date_depense DESC, d.id DESC
+    LIMIT {topn};
+  """.strip(),
+},
+"ANALYTICS_TOP_CLIENTS_BILLED_YEAR": {
+  "operation": "SELECT",
+  "table": "facture",
+  "required": ["entreprise_id"],
+  "template": """
+    SELECT
+      c.id AS client_id,
+      c.nom AS client,
+      f.devise,
+      COUNT(*) AS nb_factures,
+      COALESCE(SUM(f.montant), 0) AS total_facture
+    FROM facture f
+    JOIN client c ON c.id = f.client_id
+    JOIN projet p ON p.id = f.projet_id
+    WHERE p.entreprise_id = %s
+      AND f.date_emission >= date_trunc('year', current_date)
+      AND f.date_emission <  (date_trunc('year', current_date) + interval '1 year')
+      AND f.statut IN ('EMISE','PAYEE')  -- ajuste si tu veux seulement PAYEE
+    GROUP BY c.id, c.nom, f.devise
+    ORDER BY total_facture DESC
+    LIMIT {topn};
+  """.strip(),
+},
+
+})
+
+INTENTS.update({
+  "ANALYTICS_DEPENSE_TOTAL": {
+    "operation": "SELECT",
+    "table": "depense",
+    "required": ["entreprise_id"],
+    "template": """
+      SELECT d.devise, COALESCE(SUM(d.montant), 0) AS total
+      FROM depense d
+      JOIN projet p ON p.id = d.projet_id
+      WHERE p.entreprise_id = %s
+      GROUP BY d.devise
+      ORDER BY d.devise;
+    """.strip(),
+  },
+})
+
+INTENTS.update({
+  "ANALYTICS_DEPENSE_BREAKDOWN_TYPE": {
+    "operation": "SELECT",
+    "table": "depense",
+    "required": ["entreprise_id"],
+    "template": """
+      SELECT d.type_depense, d.devise, COUNT(*) AS nb, COALESCE(SUM(d.montant), 0) AS total
+      FROM depense d
+      JOIN projet p ON p.id = d.projet_id
+      WHERE p.entreprise_id = %s
+      GROUP BY d.type_depense, d.devise
+      ORDER BY total DESC;
+    """.strip(),
+  },
+})
+
+INTENTS.update({
+  "ANALYTICS_TRANSFERT_LIST": {
+    "operation": "SELECT",
+    "table": "transfert_interne",
+    "required": ["entreprise_id"],
+    "template": """
+      SELECT
+        ti.id,
+        ti.date_transfert,
+        ti.montant,
+        ti.devise,
+        src.nom AS compte_source,
+        dst.nom AS compte_destination
+      FROM transfert_interne ti
+      JOIN compte_financier src ON src.id = ti.compte_source_id
+      JOIN compte_financier dst ON dst.id = ti.compte_destination_id
+      WHERE src.entreprise_id = %s
+      ORDER BY ti.date_transfert DESC, ti.id DESC;
+    """.strip(),
+  },
+})
+
+# =========================================================
+# EXTRA ANALYTICS INTENTS — SQL CANONIQUE
+# =========================================================
+
+INTENTS.update({
+
+    # Dernières N dépenses (global)
+    "ANALYTICS_LASTN_DEPENSES": {
+        "operation": "SELECT",
+        "table": "depense",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT
+              d.id,
+              d.date_depense,
+              d.type_depense,
+              d.montant,
+              d.devise,
+              d.description
+            FROM depense d
+            JOIN projet p ON p.id = d.projet_id
+            WHERE p.entreprise_id = %s
+            ORDER BY d.date_depense DESC, d.id DESC
+            LIMIT {topn};
+        """.strip(),
+    },
+
+    # Liste dépenses ce mois-ci
+    "ANALYTICS_DEPENSE_LIST_MONTH": {
+        "operation": "SELECT",
+        "table": "depense",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT
+              d.date_depense,
+              d.type_depense,
+              d.montant,
+              d.devise,
+              p.nom AS projet
+            FROM depense d
+            JOIN projet p ON p.id = d.projet_id
+            WHERE p.entreprise_id = %s
+              AND d.date_depense >= date_trunc('month', current_date)
+              AND d.date_depense <  (date_trunc('month', current_date) + interval '1 month')
+            ORDER BY d.date_depense DESC;
+        """.strip(),
+    },
+
+    # Dépenses par compte ce mois
+    "ANALYTICS_DEPENSE_BY_ACCOUNT_MONTH": {
+        "operation": "SELECT",
+        "table": "depense",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT
+              cf.nom AS compte,
+              d.devise,
+              COALESCE(SUM(d.montant),0) AS total
+            FROM depense d
+            JOIN compte_financier cf ON cf.id = d.compte_id
+            JOIN projet p ON p.id = d.projet_id
+            WHERE p.entreprise_id = %s
+              AND d.date_depense >= date_trunc('month', current_date)
+              AND d.date_depense <  (date_trunc('month', current_date) + interval '1 month')
+            GROUP BY cf.nom, d.devise
+            ORDER BY total DESC;
+        """.strip(),
+    },
+
+    # Total factures PAYÉES ce mois
+    "ANALYTICS_INVOICES_PAID_TOTAL_MONTH": {
+        "operation": "SELECT",
+        "table": "facture",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT
+              f.devise,
+              COALESCE(SUM(f.montant),0) AS total_paye
+            FROM facture f
+            JOIN projet p ON p.id = f.projet_id
+            WHERE p.entreprise_id = %s
+              AND f.statut = 'PAYEE'
+              AND f.date_paiement >= date_trunc('month', current_date)
+              AND f.date_paiement <  (date_trunc('month', current_date) + interval '1 month')
+            GROUP BY f.devise;
+        """.strip(),
+    },
+
+    # Total factures PAYÉES (global)
+    "ANALYTICS_INVOICES_PAID_TOTAL": {
+        "operation": "SELECT",
+        "table": "facture",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT
+              f.devise,
+              COALESCE(SUM(f.montant),0) AS total_paye
+            FROM facture f
+            JOIN projet p ON p.id = f.projet_id
+            WHERE p.entreprise_id = %s
+              AND f.statut = 'PAYEE'
+            GROUP BY f.devise;
+        """.strip(),
+    },
+
+    # Liste factures impayées (détail)
+    "ANALYTICS_UNPAID_INVOICES_LIST": {
+        "operation": "SELECT",
+        "table": "facture",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT
+              f.id,
+              c.nom AS client,
+              p.nom AS projet,
+              f.montant,
+              f.devise,
+              f.date_emission
+            FROM facture f
+            JOIN client c ON c.id = f.client_id
+            JOIN projet p ON p.id = f.projet_id
+            WHERE p.entreprise_id = %s
+              AND f.statut <> 'PAYEE'
+            ORDER BY f.date_emission ASC;
+        """.strip(),
+    },
+
+    # Derniers N transferts
+    "ANALYTICS_LASTN_TRANSFERTS": {
+        "operation": "SELECT",
+        "table": "transfert_interne",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT
+              ti.date_transfert,
+              ti.montant,
+              ti.devise,
+              src.nom AS source,
+              dst.nom AS destination
+            FROM transfert_interne ti
+            JOIN compte_financier src ON src.id = ti.compte_source_id
+            JOIN compte_financier dst ON dst.id = ti.compte_destination_id
+            WHERE src.entreprise_id = %s
+            ORDER BY ti.date_transfert DESC
+            LIMIT {topn};
+        """.strip(),
+    },
+
+    # Audit logs
+    "ANALYTICS_AUDIT_LASTN_EVENTS": {
+        "operation": "SELECT",
+        "table": "audit_event",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT
+              ae.created_at,
+              ae.event,
+              ae.actor_id,
+              ae.details
+            FROM audit_event ae
+            WHERE ae.entreprise_id = %s
+            ORDER BY ae.created_at DESC
+            LIMIT {topn};
+        """.strip(),
+    },
+
+    # Utilisateurs + rôles
+    "ANALYTICS_USERS_ROLES": {
+        "operation": "SELECT",
+        "table": "utilisateur",
+        "required": ["entreprise_id"],
+        "template": """
+            SELECT
+              u.nom AS utilisateur,
+              r.nom AS role
+            FROM utilisateur u
+            JOIN utilisateur_entreprise ue ON ue.utilisateur_id = u.id
+            JOIN role r ON r.id = ue.role_id
+            WHERE ue.entreprise_id = %s
+            ORDER BY u.nom;
+        """.strip(),
+    },
+
+})
+
+
+
+INTENTS.update({
+  "ANALYTICS_TRANSFERT_TOTAL": {
+    "operation": "SELECT",
+    "table": "transfert_interne",
+    "required": ["entreprise_id"],
+    "template": """
+      SELECT
+        ti.devise,
+        COALESCE(SUM(ti.montant), 0) AS total
+      FROM transfert_interne ti
+      JOIN compte_financier src ON src.id = ti.compte_source_id
+      WHERE src.entreprise_id = %s
+      GROUP BY ti.devise
+      ORDER BY ti.devise;
+    """.strip(),
+  },
+})
+
+INTENTS.update({
+  "ANALYTICS_INVOICES_ISSUED_TOTAL": {
+    "operation": "SELECT",
+    "table": "facture",
+    "required": ["entreprise_id"],
+    "template": """
+      SELECT
+        f.devise,
+        COUNT(*) AS nb_factures,
+        COALESCE(SUM(f.montant), 0) AS total_emis
+      FROM facture f
+      JOIN projet p ON p.id = f.projet_id
+      WHERE p.entreprise_id = %s
+        AND f.statut = 'EMISE'
+      GROUP BY f.devise
+      ORDER BY f.devise;
+    """.strip(),
+  },
+})
+
+INTENTS.update({
+  "ANALYTICS_TOPN_TRANSFERTS": {
+    "operation": "SELECT",
+    "table": "transfert_interne",
+    "required": ["entreprise_id"],
+    "template": """
+      SELECT
+        ti.date_transfert,
+        ti.montant,
+        ti.devise,
+        src.nom AS source,
+        dst.nom AS destination
+      FROM transfert_interne ti
+      JOIN compte_financier src ON src.id = ti.compte_source_id
+      JOIN compte_financier dst ON dst.id = ti.compte_destination_id
+      WHERE src.entreprise_id = %s
+      ORDER BY ti.montant DESC
+      LIMIT {topn};
+    """.strip(),
+  },
+})
+
+INTENTS.update({
+  "ANALYTICS_INVOICES_LIST": {
+    "operation": "SELECT",
+    "table": "facture",
+    "required": ["entreprise_id"],
+    "template": """
+      SELECT
+        f.id,
+        f.date_emission,
+        f.statut,
+        c.nom AS client,
+        p.nom AS projet,
+        f.montant,
+        f.devise
+      FROM facture f
+      JOIN client c ON c.id = f.client_id
+      JOIN projet p ON p.id = f.projet_id
+      WHERE p.entreprise_id = %s
+      ORDER BY f.date_emission DESC, f.id DESC
+      LIMIT 50;
+    """.strip(),
+  },
+})
+
 # =========================================================
 # Few-shot (extended: depense + facture + transfert)
 # =========================================================
@@ -1668,15 +2190,7 @@ def build_llm_prompt(user_input: str, context: Dict[str, Any], force_plan: bool)
         "INSERT_FACTURE": INTENTS["INSERT_FACTURE"]["template"],
         "INSERT_TRANSFERT": INTENTS["INSERT_TRANSFERT"]["template"],
     }
-    analytics_intents = [
-        "ANALYTICS_DEPENSE_TOTAL_MONTH",
-        "ANALYTICS_TRANSFERT_TOTAL_MONTH",
-        "ANALYTICS_TRANSFERT_LIST_MONTH",
-        "ANALYTICS_DEPENSE_BREAKDOWN_TYPE_MONTH",
-        "ANALYTICS_ACCOUNT_BALANCES",
-        "ANALYTICS_UNPAID_INVOICES","ANALYTICS_INVOICES_ISSUED_TOTAL_MONTH",
-    ]
-
+    analytics_intents = [k for k in INTENTS.keys() if k.startswith("ANALYTICS_")]
 
     return f"""
 Tu es un assistant Text2SQL STRICT pour PostgreSQL.
@@ -1756,22 +2270,185 @@ PLAN:
 """.strip()
 
 def detect_analytics_intent(user_input: str) -> Optional[str]:
-    ui = norm_txt(user_input)
+    """
+    Règle principale:
+    - On ne met un filtre de période (mois/année/YYYY-MM/YYYY) QUE si l'utilisateur le mentionne.
+    - Donc: on matche d'abord les intents "avec période" (MONTH/YEAR/PERIOD),
+      puis seulement ensuite les variantes "sans période".
+    """
+    ui_raw = user_input or ""
+    ui = norm_txt(ui_raw)
+
+    # -------------------------------------------------------
+    # 0) Analytics "structurés" (top/last/by project) PRIORITAIRES
+    # -------------------------------------------------------
+    # last N dépenses d’un projet
+    if ANALYTICS_LASTN_DEPENSES_PROJECT_RE.search(ui):
+        return "ANALYTICS_LASTN_DEPENSES_FOR_PROJECT"
+
+    # top N projets par dépenses ce mois
+    if ANALYTICS_TOPN_PROJECTS_SPEND_MONTH_RE.search(ui):
+        return "ANALYTICS_TOP_PROJECTS_BY_SPEND_MONTH"
+
+    # total dépenses ce mois par projet
+    if ANALYTICS_DEPENSE_TOTAL_MONTH_BY_PROJECT_RE.search(ui):
+        return "ANALYTICS_DEPENSE_TOTAL_MONTH_BY_PROJECT"
+
+    # top N clients facturés cette année
+    if ANALYTICS_TOPN_CLIENTS_BILLED_YEAR_RE.search(ui):
+        return "ANALYTICS_TOP_CLIENTS_BILLED_YEAR"
+
+    # dépenses par projet sur période (année / mois / ce mois / this year / this month)
+    if ANALYTICS_DEPENSE_BY_PROJECT_PERIOD_RE.search(ui):
+        return "ANALYTICS_DEPENSE_BY_PROJECT_PERIOD"
+
+    # revenu / CA par projet sur une année précise (PAYEE)
+    if ANALYTICS_REVENUE_BY_PROJECT_YEAR_RE.search(ui):
+        return "ANALYTICS_REVENUE_BY_PROJECT_YEAR"
+
+    # -------------------------------------------------------
+    # 1) PÉRIODE EXPLICITE — matcher AVANT les variantes sans période
+    # -------------------------------------------------------
+    # Factures émises ce mois-ci
     if ANALYTICS_INVOICES_ISSUED_TOTAL_MONTH_RE.search(ui):
         return "ANALYTICS_INVOICES_ISSUED_TOTAL_MONTH"
-    if ANALYTICS_UNPAID_INVOICES_RE.search(ui):
-        return "ANALYTICS_UNPAID_INVOICES"
+
+    # Total dépenses ce mois-ci
     if ANALYTICS_DEPENSE_TOTAL_MONTH_RE.search(ui):
         return "ANALYTICS_DEPENSE_TOTAL_MONTH"
+
+    # Répartition dépenses par type ce mois-ci
     if ANALYTICS_DEPENSE_BREAKDOWN_TYPE_MONTH_RE.search(ui):
         return "ANALYTICS_DEPENSE_BREAKDOWN_TYPE_MONTH"
-    if ANALYTICS_ACCOUNT_BALANCES_RE.search(ui):
-        return "ANALYTICS_ACCOUNT_BALANCES"
-    if ANALYTICS_TRANSFERT_TOTAL_MONTH_RE.search(ui):
-        return "ANALYTICS_TRANSFERT_TOTAL_MONTH"
+
+    # Transferts listés ce mois-ci
     if ANALYTICS_TRANSFERT_LIST_MONTH_RE.search(ui):
         return "ANALYTICS_TRANSFERT_LIST_MONTH"
+
+    # Total transferts ce mois-ci
+    if ANALYTICS_TRANSFERT_TOTAL_MONTH_RE.search(ui):
+        return "ANALYTICS_TRANSFERT_TOTAL_MONTH"
+
+    # (optionnel) tu avais aussi TOPN_TRANSFERTS_RE (si tu ajoutes l’intent correspondant)
+    # Exemple: "Top 5 transferts" (sans période ou avec "ce mois")
+    # if ANALYTICS_TOPN_TRANSFERTS_RE.search(ui):
+    #     return "ANALYTICS_TOPN_TRANSFERTS"  # à créer si tu veux
+
+    # -------------------------------------------------------
+    # 2) SANS PÉRIODE — pas de filtre de date
+    # -------------------------------------------------------
+    # Soldes comptes (jamais besoin de période)
+    if ANALYTICS_ACCOUNT_BALANCES_RE.search(ui):
+        return "ANALYTICS_ACCOUNT_BALANCES"
+
+    # Factures impayées (pas une question de période)
+    if ANALYTICS_UNPAID_INVOICES_RE.search(ui):
+        return "ANALYTICS_UNPAID_INVOICES"
+
+    # Total dépenses (sans période)
+    # -> nécessite ANALYTICS_DEPENSE_TOTAL_RE
+    if "ANALYTICS_DEPENSE_TOTAL_RE" in globals():
+        if ANALYTICS_DEPENSE_TOTAL_RE.search(ui):
+            return "ANALYTICS_DEPENSE_TOTAL"
+
+    # Répartition dépenses par type (sans période)
+    # -> nécessite ANALYTICS_DEPENSE_BREAKDOWN_TYPE_RE
+    if "ANALYTICS_DEPENSE_BREAKDOWN_TYPE_RE" in globals():
+        if ANALYTICS_DEPENSE_BREAKDOWN_TYPE_RE.search(ui):
+            return "ANALYTICS_DEPENSE_BREAKDOWN_TYPE"
+
+    # Liste transferts (sans période)
+    # -> nécessite ANALYTICS_TRANSFERT_LIST_RE
+    if "ANALYTICS_TRANSFERT_LIST_RE" in globals():
+        if ANALYTICS_TRANSFERT_LIST_RE.search(ui):
+            return "ANALYTICS_TRANSFERT_LIST"
+
+    # Total transferts (sans période)
+    # -> nécessite ANALYTICS_TRANSFERT_TOTAL_RE
+    if "ANALYTICS_TRANSFERT_TOTAL_RE" in globals():
+        if ANALYTICS_TRANSFERT_TOTAL_RE.search(ui):
+            return "ANALYTICS_TRANSFERT_TOTAL"
+
+    # Total factures émises (sans période)
+    # -> nécessite ANALYTICS_INVOICES_ISSUED_TOTAL_RE
+    if "ANALYTICS_INVOICES_ISSUED_TOTAL_RE" in globals():
+        if ANALYTICS_INVOICES_ISSUED_TOTAL_RE.search(ui):
+            return "ANALYTICS_INVOICES_ISSUED_TOTAL"
+
+    # Top clients par CA (PAYEE) (sans période)
+    # -> ton regex ANALYTICS_TOP_CLIENTS_CA_RE est déjà "top N clients ... ca"
+    if ANALYTICS_TOP_CLIENTS_CA_RE.search(ui):
+        return "ANALYTICS_TOP_CLIENTS_CA"
+
+    # Budget vs dépensé (sans période)
+    if ANALYTICS_BUDGET_VS_SPENT_RE.search(ui):
+        return "ANALYTICS_BUDGET_VS_SPENT"
+
+    # ------------------------------
+    # EXTRA analytics detection
+    # ------------------------------
+
+    if ANALYTICS_LASTN_DEPENSES_RE.search(ui):
+        return "ANALYTICS_LASTN_DEPENSES"
+
+    if ANALYTICS_DEPENSE_LIST_MONTH_RE.search(ui):
+        return "ANALYTICS_DEPENSE_LIST_MONTH"
+
+    if ANALYTICS_DEPENSE_BY_ACCOUNT_MONTH_RE.search(ui):
+        return "ANALYTICS_DEPENSE_BY_ACCOUNT_MONTH"
+
+    if ANALYTICS_INVOICES_PAID_TOTAL_MONTH_RE.search(ui):
+        return "ANALYTICS_INVOICES_PAID_TOTAL_MONTH"
+
+    if ANALYTICS_INVOICES_PAID_TOTAL_RE.search(ui):
+        return "ANALYTICS_INVOICES_PAID_TOTAL"
+
+    if ANALYTICS_UNPAID_INVOICES_LIST_RE.search(ui):
+        return "ANALYTICS_UNPAID_INVOICES_LIST"
+
+    if ANALYTICS_LASTN_TRANSFERTS_RE.search(ui):
+        return "ANALYTICS_LASTN_TRANSFERTS"
+
+    if ANALYTICS_TOPN_TRANSFERTS_RE.search(ui):
+        return "ANALYTICS_TOPN_TRANSFERTS"
+
+    if ANALYTICS_AUDIT_LASTN_EVENTS_RE.search(ui):
+        return "ANALYTICS_AUDIT_LASTN_EVENTS"
+
+    if ANALYTICS_USERS_ROLES_RE.search(ui):
+        return "ANALYTICS_USERS_ROLES"
+        
+    if ANALYTICS_TRANSFERT_TOTAL_RE.search(ui):
+        return "ANALYTICS_TRANSFERT_TOTAL"
+    if ANALYTICS_INVOICES_LIST_RE.search(ui):
+        return "ANALYTICS_INVOICES_LIST"
+    if ANALYTICS_INVOICES_ISSUED_TOTAL_RE.search(ui):
+        return "ANALYTICS_INVOICES_ISSUED_TOTAL"
+    
+    # -------------------------------------------------------
+    # 3) Rien trouvé
+    # -------------------------------------------------------
     return None
+
+
+
+def extract_topn(ui: str, default: int = 10) -> int:
+    # top N
+    m = re.search(r"\btop\s*(\d{1,3})\b", ui)
+    if m:
+        return max(1, min(100, int(m.group(1))))
+
+    # dernières N
+    m = re.search(r"\b(derni[eè]res?|last)\s*(\d{1,3})\b", ui)
+    if m:
+        return max(1, min(200, int(m.group(2))))
+
+    # N dernières
+    m = re.search(r"\b(\d{1,3})\s*(derni[eè]res?|last)\b", ui)
+    if m:
+        return max(1, min(200, int(m.group(1))))
+
+    return default
 
 
 # =========================================================
@@ -2105,6 +2782,48 @@ def continue_pending_plan(
         pending.filled["entreprise_id"] = eid
 
         meta = INTENTS.get(intent)
+        if intent == "ANALYTICS_TOP_PROJECTS_BY_SPEND_MONTH":
+            original = context.get("original_user_input") or ""
+            topn = extract_topn(norm_txt(original), default=5)
+
+            sql = INTENTS[intent]["template"].format(topn=topn)
+            params = [int(context["entreprise_id"])]
+
+            notes.append(f"Top {topn} projets par dépenses (mois en cours)")
+            return sql, params, {}, Clarification(needed=False), pending, notes
+        if intent == "ANALYTICS_LASTN_DEPENSES_FOR_PROJECT":
+            original = context.get("original_user_input") or ""
+            ui = norm_txt(original)
+            topn = extract_topn(ui, default=10)
+
+            proj_q = _extract_project_query(original)
+            if not proj_q:
+                # clarification projet
+                matches = resolve_by_name("projet", "", eid, topk=RESOLVE_TOPK)
+                return None, [], {}, _clarify_pick("projet", "", matches, lang), pending, notes
+
+            matches = resolve_by_name("projet", proj_q, eid, topk=RESOLVE_TOPK)
+            if len(matches) != 1:
+                return None, [], {}, _clarify_pick("projet", proj_q, matches, lang), pending, notes
+
+            pid = int(matches[0]["id"])
+            sql = INTENTS[intent]["template"].format(topn=topn)
+            params = [pid]
+            return sql, params, {}, Clarification(needed=False), pending, notes
+        
+        if intent == "ANALYTICS_TOP_CLIENTS_BILLED_YEAR":
+            original = context.get("original_user_input") or ""
+            topn = extract_topn(norm_txt(original), default=5)
+            sql = INTENTS[intent]["template"].format(topn=topn)
+            params = [eid]
+            return sql, params, {}, Clarification(needed=False), pending, notes
+
+        if intent == "ANALYTICS_TOPN_TRANSFERTS":
+            original = context.get("original_user_input") or ""
+            topn = extract_topn(norm_txt(original), default=5)
+            sql = INTENTS[intent]["template"].format(topn=topn)
+            return sql, [eid], {}, Clarification(needed=False), pending, notes
+
         if not meta:
             return None, [], {}, Clarification(
                 needed=True,
@@ -2113,6 +2832,12 @@ def continue_pending_plan(
             ), pending, notes
 
         sql = (meta.get("template") or "").strip()
+         # ✅ Si le template contient un placeholder {topn}, on le résout ici
+        if "{topn}" in sql:
+            original = context.get("original_user_input") or ""
+            topn = extract_topn(norm_txt(original), default=5)
+            sql = sql.format(topn=topn)
+            notes.append(f"topn injecté={topn} pour intent={intent}")
         params = [eid]
 
         notes.append(f"{intent} resolved.")
@@ -2121,6 +2846,7 @@ def continue_pending_plan(
     # -----------------------------------------------------
     # INTENT: INSERT_DEPENSE (keep your logic, cleaned)
     # -----------------------------------------------------
+
     if intent == "INSERT_DEPENSE":
         # 1) projet
         if "projet_id" not in filled:
@@ -2632,8 +3358,7 @@ def convert(req: ConvertRequest):
     # =========================================================
     # Analytics bypass (avoid LLM hallucinations)
     # =========================================================
-    ui = norm_txt(req.user_input)
-    analytics_intent = detect_analytics_intent(ui)
+    analytics_intent = detect_analytics_intent(req.user_input)
     log_event(
     "analytics_detect",
     request_id=request_id,
