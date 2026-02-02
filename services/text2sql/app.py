@@ -360,338 +360,6 @@ def _extract_project_query(text: str):
     return q or None
 
 
-def try_analytics_bypass_sql(user_input: str, entreprise_id: int | None) -> dict | None:
-    ui_raw = user_input or ""
-    ui = norm_txt(ui_raw)
-    # (0) Total dépenses ce mois (par devise) — canon
-    if ANALYTICS_DEPENSE_TOTAL_MONTH_RE.search(ui):
-        if entreprise_id is None:
-            return None
-        return {
-            "mode": "sql",
-            "operation": "SELECT",
-            "sql": """
-                SELECT d.devise, COALESCE(SUM(d.montant), 0) AS total
-                FROM depense d
-                JOIN projet p ON p.id = d.projet_id
-                WHERE p.entreprise_id = %s
-                  AND d.date_depense >= date_trunc('month', current_date)
-                  AND d.date_depense <  (date_trunc('month', current_date) + interval '1 month')
-                GROUP BY d.devise
-                ORDER BY d.devise;
-            """.strip(),
-            "params": [entreprise_id],
-        }
-
-    # (1) Transferts internes réalisés ce mois-ci (liste)
-    if ANALYTICS_TRANSFERT_LIST_MONTH_RE.search(ui):
-        if entreprise_id is None:
-            return None
-        return {
-            "mode": "sql",
-            "operation": "SELECT",
-            "sql": """
-                SELECT
-                  ti.id,
-                  ti.date_transfert,
-                  ti.montant,
-                  ti.devise,
-                  src.nom AS compte_source,
-                  dst.nom AS compte_destination
-                FROM transfert_interne ti
-                JOIN compte_financier src ON src.id = ti.compte_source_id
-                JOIN compte_financier dst ON dst.id = ti.compte_destination_id
-                WHERE src.entreprise_id = %s
-                  AND ti.date_transfert >= date_trunc('month', current_date)
-                  AND ti.date_transfert <  (date_trunc('month', current_date) + interval '1 month')
-                ORDER BY ti.date_transfert DESC, ti.id DESC;
-            """.strip(),
-            "params": [entreprise_id],
-        }
-
-    # (2) Total transferts ce mois-ci (par devise)
-    if ANALYTICS_TRANSFERT_TOTAL_MONTH_RE.search(ui):
-        if entreprise_id is None:
-            return None
-        return {
-            "mode": "sql",
-            "operation": "SELECT",
-            "sql": """
-                SELECT
-                  ti.devise,
-                  COALESCE(SUM(ti.montant), 0) AS total
-                FROM transfert_interne ti
-                JOIN compte_financier src ON src.id = ti.compte_source_id
-                WHERE src.entreprise_id = %s
-                  AND ti.date_transfert >= date_trunc('month', current_date)
-                  AND ti.date_transfert <  (date_trunc('month', current_date) + interval '1 month')
-                GROUP BY ti.devise
-                ORDER BY ti.devise;
-            """.strip(),
-            "params": [entreprise_id],
-        }
-
-    # (3) Répartition dépenses par type ce mois-ci (type + devise)
-    if ANALYTICS_DEPENSE_BREAKDOWN_TYPE_MONTH_RE.search(ui):
-        if entreprise_id is None:
-            return None
-        return {
-            "mode": "sql",
-            "operation": "SELECT",
-            "sql": """
-                SELECT
-                  d.type_depense,
-                  d.devise,
-                  COUNT(*) AS nb,
-                  COALESCE(SUM(d.montant), 0) AS total
-                FROM depense d
-                JOIN projet p ON p.id = d.projet_id
-                WHERE p.entreprise_id = %s
-                  AND d.date_depense >= date_trunc('month', current_date)
-                  AND d.date_depense <  (date_trunc('month', current_date) + interval '1 month')
-                GROUP BY d.type_depense, d.devise
-                ORDER BY total DESC;
-            """.strip(),
-            "params": [entreprise_id],
-        }
-
-    # (4) Top N dépenses récentes d’un projet (LIMIT N explicite)
-    m = ANALYTICS_TOPN_DEPENSES_PROJECT_RE.search(ui)
-    if m:
-        if entreprise_id is None:
-            return None
-        n = int(m.group(2))
-        proj_q = _extract_project_query(ui)
-        if not proj_q:
-            return None
-
-        matches = resolve_by_name("projet", proj_q, entreprise_id, topk=5)
-        if len(matches) != 1:
-            return None
-        pid = int(matches[0]["id"])
-
-        return {
-            "mode": "sql",
-            "operation": "SELECT",
-            "sql": f"""
-                SELECT
-                  d.id,
-                  d.date_depense,
-                  d.type_depense,
-                  d.montant,
-                  d.devise,
-                  d.description
-                FROM depense d
-                WHERE d.projet_id = %s
-                ORDER BY d.date_depense DESC, d.id DESC
-                LIMIT {n};
-            """.strip(),
-            "params": [pid],
-        }
-
-    # (5) Dépenses par projet sur période (année / mois / ce mois)
-    if ANALYTICS_DEPENSE_BY_PROJECT_PERIOD_RE.search(ui):
-        if entreprise_id is None:
-            return None
-
-        ym = _extract_month_year(ui)
-        y = _extract_year(ui)
-
-        if re.search(r"\b(ce mois|this month)\b", ui, re.I):
-            where_period = """
-              d.date_depense >= date_trunc('month', current_date)
-              AND d.date_depense <  (date_trunc('month', current_date) + interval '1 month')
-            """.strip()
-            params = [entreprise_id]
-
-        elif ym:
-            year, month = ym
-            where_period = """
-              d.date_depense >= make_date(%s, %s, 1)
-              AND d.date_depense <  (make_date(%s, %s, 1) + interval '1 month')
-            """.strip()
-            params = [entreprise_id, year, month, year, month]
-
-        elif y:
-            where_period = """
-              d.date_depense >= make_date(%s, 1, 1)
-              AND d.date_depense <  make_date(%s, 1, 1)
-            """.strip()
-            params = [entreprise_id, y, y + 1]
-
-        else:
-            return None
-
-        return {
-            "mode": "sql",
-            "operation": "SELECT",
-            "sql": f"""
-                SELECT
-                  p.id AS projet_id,
-                  p.nom AS projet,
-                  d.devise,
-                  COALESCE(SUM(d.montant), 0) AS total_depenses
-                FROM depense d
-                JOIN projet p ON p.id = d.projet_id
-                WHERE p.entreprise_id = %s
-                  AND {where_period}
-                GROUP BY p.id, p.nom, d.devise
-                ORDER BY total_depenses DESC;
-            """.strip(),
-            "params": params,
-        }
-
-    # (6) Revenu total par projet sur une année (factures PAYEE) — canon
-    m = ANALYTICS_REVENUE_BY_PROJECT_YEAR_RE.search(ui)
-    if m:
-        if entreprise_id is None:
-            return None
-        year = int(m.group(4))
-        return {
-            "mode": "sql",
-            "operation": "SELECT",
-            "sql": """
-                SELECT
-                  p.id AS projet_id,
-                  p.nom AS projet,
-                  f.devise,
-                  COALESCE(SUM(f.montant), 0) AS revenu_total
-                FROM facture f
-                JOIN projet p ON p.id = f.projet_id
-                WHERE p.entreprise_id = %s
-                  AND f.statut = 'PAYEE'
-                  AND f.date_emission >= make_date(%s, 1, 1)
-                  AND f.date_emission <  make_date(%s, 1, 1)
-                GROUP BY p.id, p.nom, f.devise
-                ORDER BY revenu_total DESC;
-            """.strip(),
-            "params": [entreprise_id, year, year + 1],
-        }
-
-    # (7) Factures impayées par client / projet (statut != PAYEE)
-    if ANALYTICS_UNPAID_INVOICES_RE.search(ui):
-        if entreprise_id is None:
-            return None
-        return {
-            "mode": "sql",
-            "operation": "SELECT",
-            "sql": """
-                SELECT
-                  c.id AS client_id,
-                  c.nom AS client,
-                  p.id AS projet_id,
-                  p.nom AS projet,
-                  f.devise,
-                  COUNT(*) AS nb_factures,
-                  COALESCE(SUM(f.montant), 0) AS total_du
-                FROM facture f
-                JOIN projet p ON p.id = f.projet_id
-                JOIN client c ON c.id = f.client_id
-                WHERE p.entreprise_id = %s
-                  AND f.statut <> 'PAYEE'
-                GROUP BY c.id, c.nom, p.id, p.nom, f.devise
-                ORDER BY total_du DESC;
-            """.strip(),
-            "params": [entreprise_id],
-        }
-
-    # (8) Budget vs dépensé par projet (budget_total)
-    if ANALYTICS_BUDGET_VS_SPENT_RE.search(ui):
-        if entreprise_id is None:
-            return None
-        return {
-            "mode": "sql",
-            "operation": "SELECT",
-            "sql": """
-                SELECT
-                  p.id AS projet_id,
-                  p.nom AS projet,
-                  p.budget_total AS budget_total,
-                  COALESCE(SUM(d.montant), 0) AS depense_total,
-                  (p.budget_total - COALESCE(SUM(d.montant), 0)) AS restant
-                FROM projet p
-                LEFT JOIN depense d ON d.projet_id = p.id
-                WHERE p.entreprise_id = %s
-                GROUP BY p.id, p.nom, p.budget_total
-                ORDER BY restant ASC;
-            """.strip(),
-            "params": [entreprise_id],
-        }
-
-    # (9) Soldes comptes (compte_financier.solde)
-    if ANALYTICS_ACCOUNT_BALANCES_RE.search(ui):
-        if entreprise_id is None:
-            return None
-        return {
-            "mode": "sql",
-            "operation": "SELECT",
-            "sql": """
-                SELECT
-                  cf.id,
-                  cf.nom,
-                  cf.devise,
-                  cf.solde
-                FROM compte_financier cf
-                WHERE cf.entreprise_id = %s
-                ORDER BY cf.nom;
-            """.strip(),
-            "params": [entreprise_id],
-        }
-
-    # (10) Top clients par CA (factures PAYEE) — top N optionnel
-    m = ANALYTICS_TOP_CLIENTS_CA_RE.search(ui)
-    if m:
-        if entreprise_id is None:
-            return None
-        topn = int(m.group(2)) if m.group(2) else 10
-        return {
-            "mode": "sql",
-            "operation": "SELECT",
-            "sql": f"""
-                SELECT
-                  c.id AS client_id,
-                  c.nom AS client,
-                  f.devise,
-                  COALESCE(SUM(f.montant), 0) AS ca_total
-                FROM facture f
-                JOIN client c ON c.id = f.client_id
-                JOIN projet p ON p.id = f.projet_id
-                WHERE p.entreprise_id = %s
-                  AND f.statut = 'PAYEE'
-                GROUP BY c.id, c.nom, f.devise
-                ORDER BY ca_total DESC
-                LIMIT {topn};
-            """.strip(),
-            "params": [entreprise_id],
-        }
-
-    # (X) Total des factures émises ce mois-ci (par devise)
-    if ANALYTICS_INVOICES_ISSUED_TOTAL_MONTH_RE.search(ui):
-        if entreprise_id is None:
-            return None
-        return {
-            "mode": "sql",
-            "operation": "SELECT",
-            "sql": """
-                SELECT
-                f.devise,
-                COUNT(*) AS nb_factures,
-                COALESCE(SUM(f.montant), 0) AS total_emis
-                FROM facture f
-                JOIN projet p ON p.id = f.projet_id
-                WHERE p.entreprise_id = %s
-                AND f.date_emission >= date_trunc('month', current_date)
-                AND f.date_emission <  (date_trunc('month', current_date) + interval '1 month')
-                AND f.statut = 'EMISE'
-                GROUP BY f.devise
-                ORDER BY f.devise;
-            """.strip(),
-            "params": [entreprise_id],
-        }
-
-
-    return None
-
 # =========================================================
 # FastAPI
 # =========================================================
@@ -2653,6 +2321,68 @@ def get_user_role_for_enterprise(user_id: int, entreprise_id: int) -> Optional[s
 # =========================================================
 # Continuation (DEPENSE preserved + add FACTURE + TRANSFERT)
 # =========================================================
+
+def run_pipeline(user_input: str, context: Dict[str, Any]) -> Tuple[Optional[str], List[Any], Clarification, Optional[PendingPlan], List[str]]:
+    """
+    Retourne soit:
+      - (sql, params, Clarification(False), None, notes)   => terminé
+      - (None, [], Clarification(True,...), pending, notes) => besoin clarification
+    """
+    notes: List[str] = []
+    lang = context.get("lang", "fr")
+
+    # 1) analytics intent (plan)
+    analytics_intent = detect_analytics_intent(user_input)
+
+    if analytics_intent:
+        pending = PendingPlan(
+            operation="SELECT",
+            intent=analytics_intent,
+            sql_template="",
+            template_params=[],
+            entities={},
+            filled={},
+        )
+        # on essaie de résoudre tout de suite (si entreprise_id déjà là)
+        sql, params, _, clar, pending2, cont_notes = continue_pending_plan(
+            pending=pending,
+            user_input="",
+            context=context,
+        )
+        notes += cont_notes
+        if clar.needed:
+            return None, [], clar, pending2, notes
+        return sql, params, Clarification(needed=False), None, notes
+
+    # 3) LLM
+    force_plan = should_force_plan(user_input)
+    prompt = build_llm_prompt(user_input, context, force_plan=force_plan)
+    llm_obj = call_gpt(prompt)
+    llm = parse_llm_output(llm_obj)
+
+    if force_plan and llm.mode.lower() != "plan":
+        raise HTTPException(400, "Mode PLAN requis (écriture).")
+
+    if llm.mode.lower() == "plan":
+        pending = PendingPlan(
+            operation=(llm.operation or "UNKNOWN"),
+            intent=getattr(llm, "intent", None),
+            sql_template=(llm.sql_template or ""),
+            template_params=list(llm.template_params or []),
+            entities=dict(getattr(llm, "entities", {}) or {}),
+            filled={},
+        )
+        sql, params, _, clar, pending2, cont_notes = continue_pending_plan(
+            pending=pending, user_input="", context=context
+        )
+        notes += cont_notes
+        if clar.needed:
+            return None, [], clar, pending2, notes
+        return sql, params, Clarification(needed=False), None, notes
+
+    # mode sql direct
+    return (llm.sql or "").strip(), list(llm.params or []), Clarification(needed=False), None, notes
+
 def continue_pending_plan(
     pending: PendingPlan,
     user_input: str,
@@ -2664,23 +2394,43 @@ def continue_pending_plan(
 
     if pending.intent == "REPLAY_ORIGINAL_AFTER_TENANT":
         original = context.get("original_user_input") or ""
+        if not original:
+            raise HTTPException(400, "original_user_input manquant")
 
-        # cas spécial: liste les projets
-        if re.search(r"\b(liste|listez|list)\b.*\b(projets?|projects?)\b", original, re.I):
-            sql = INTENTS["SELECT_PROJECTS"]["template"]
-            return sql, [context["entreprise_id"]], {}, Clarification(needed=False), pending, ["replay_select_projects"]
+        # relancer pipeline: analytics intent -> bypass -> LLM -> auto-continue
+        force_plan = should_force_plan(original)
+        analytics_intent = detect_analytics_intent(original)
 
-        bypass = try_analytics_bypass_sql(original, context.get("entreprise_id"))
-        if bypass:
-            return bypass["sql"], bypass.get("params", []), {}, Clarification(needed=False), pending, ["replay_original"]
+        if analytics_intent:
+            # on construit un nouveau pending plan analytics
+            new_pending = PendingPlan(
+                operation="SELECT",
+                intent=analytics_intent,
+                sql_template="",
+                template_params=[],
+                entities={},
+                filled={},
+            )
+            # puis on re-rentre sur continue_pending_plan MAIS sur new_pending
+            return continue_pending_plan(new_pending, user_input="", context=context)
 
-        # ✅ IMPORTANT: pas "info" => relancer LLM (sinon tu retombes dans ton bug)
-        
-        return None, [], {}, Clarification(
-            needed=True,
-            entity="replay",
-            message="REPLAY: relancer /continue sur original_user_input via LLM (pas de fallback info ici)."
-        ), pending, notes
+        prompt = build_llm_prompt(original, context, force_plan=force_plan)
+        llm_obj = call_gpt(prompt)
+        llm = parse_llm_output(llm_obj)
+
+        if llm.mode.lower() == "plan":
+            new_pending = PendingPlan(
+                operation=llm.operation,
+                intent=getattr(llm, "intent", None),
+                sql_template=getattr(llm, "sql_template", "") or "",
+                template_params=list(getattr(llm, "template_params", []) or []),
+                entities=dict(getattr(llm, "entities", {}) or {}),
+                filled={},
+            )
+            return continue_pending_plan(new_pending, user_input="", context=context)
+
+        return (llm.sql or ""), list(llm.params or []), {}, Clarification(needed=False), pending, ["replay_llm_sql"]
+
 
 
     # record the answer to the last asked field
@@ -2827,7 +2577,7 @@ def continue_pending_plan(
         if not meta:
             return None, [], {}, Clarification(
                 needed=True,
-                entity="info",
+                entity=None,
                 message=f"Intent analytics inconnu: {intent}. Reformule.",
             ), pending, notes
 
@@ -3262,7 +3012,7 @@ def continue_pending_plan(
     
     return None, [], {}, Clarification(
         needed=True,
-        entity="info",
+        entity=None,
         field=None,
         message="Je ne sais pas continuer ce plan (intent non supportée). Reformule la demande.",
     ), pending, notes
@@ -3379,25 +3129,10 @@ def convert(req: ConvertRequest):
         }
         llm_ms = 0
     else:
-        bypass = try_analytics_bypass_sql(req.user_input, context.get("entreprise_id"))
-
-        if bypass:
-            llm_obj = bypass
-            llm_ms = 0
-        else:
-            t0 = time.time()
-            if TEXT2SQL_STUB_LLM:
-                llm_obj = {
-                    "mode": "sql",
-                    "operation": "SELECT",
-                    "sql": "SELECT p.id, p.nom FROM projet p ORDER BY p.nom;",
-                    "params": [],
-                }
-            else:
-                prompt = build_llm_prompt(req.user_input, context, force_plan=force_plan)
-                llm_obj = call_gpt(prompt)
-            llm_ms = int((time.time() - t0) * 1000)
-
+        t0 = time.time()
+        prompt = build_llm_prompt(req.user_input, context, force_plan=force_plan)
+        llm_obj = call_gpt(prompt)
+        llm_ms = int((time.time() - t0) * 1000)
     try:
         llm: LLMOutput = parse_llm_output(llm_obj)
     except (ValidationError, Exception) as e:
@@ -3647,60 +3382,27 @@ def continue_plan(req: ContinueRequest):
     user_input=req.user_input,
 )
 
-        bypass = try_analytics_bypass_sql(original, context.get("entreprise_id"))
-        if bypass:
-            sql = (bypass["sql"] or "").strip()
-            params = list(bypass.get("params") or [])
+        sql, params, clar, pending, notes2 = run_pipeline(original, context)
+        notes.extend(notes2)
 
-            if contains_forbidden_keywords(sql):
-                raise HTTPException(400, "SQL interdit (DDL/DCL)")
-            node = parse_sql_single(sql)
-            sql = node.sql(dialect="postgres")
-            op = classify_operation(sql)
-            risk_level, needs_approval = risk_level_for(op)
-
-            tables, schema_ok, schema_notes = validate_tables(node, _SCHEMA_CACHE)
-            functions_ok, fn_notes = validate_functions(node)
-            columns_ok, col_notes = validate_columns(node, _SCHEMA_CACHE)
-
-            notes = []
-            notes.extend(schema_notes + fn_notes + col_notes)
-
-            tenant_sql, tenant_params, tenant_scoped, tenant_notes = enforce_tenant_scope(
-                sql, context.get("entreprise_id"), _SCHEMA_CACHE
-            )
-            notes.extend(tenant_notes)
-            if tenant_params:
-                params = params + tenant_params
-                sql = tenant_sql
-                node = parse_sql_single(sql)
-
-            duration_ms = int((time.time() - started) * 1000)
-
+        if clar.needed:
             return SQLPlan(
                 request_id=request_id,
                 user_input=req.user_input,
-                operation=op,
-                sql=sql,
-                params=params,
-                tables=tables,
-                risk=RiskInfo(level=risk_level, needs_approval=needs_approval),
+                operation="SELECT",
+                sql="",
+                params=[],
+                tables=[],
+                risk=RiskInfo(level="medium", needs_approval=False),
                 static_checks=StaticChecks(
-                    ast_parsed=True,
-                    ddl_blocked=True,
-                    schema_ok=schema_ok,
-                    single_statement=True,
-                    tenant_scoped=True,
-                    columns_ok=columns_ok,
-                    no_select_star=True,
-                    limit_ok=True,
-                    functions_ok=functions_ok,
+                    ast_parsed=False, ddl_blocked=True, schema_ok=True, single_statement=True,
+                    tenant_scoped=False, columns_ok=True, no_select_star=True, limit_ok=True, functions_ok=True,
                 ),
                 context=context,
                 resolved={},
-                clarification=Clarification(needed=False),
-                pending_plan=None,
-                notes=notes + [f"analytics_replay duration_ms={duration_ms}"],
+                clarification=clar,
+                pending_plan=pending,
+                notes=notes,
             )
         # ✅ si pas analytics, relancer le pipeline LLM sur la requête originale
         force_plan = should_force_plan(original)
@@ -3731,8 +3433,9 @@ def continue_plan(req: ContinueRequest):
                 sql_template=(llm.sql_template or ""),
                 template_params=list(llm.template_params or []),
                 entities=dict(getattr(llm, "entities", {}) or {}),
-                filled=req.pending_plan.filled or {},  # conserve si besoin
+                filled=req.pending_plan.filled or {},
             )
+
             sql, params, resolved, clarification, pending2, notes2 = continue_pending_plan(
                 pending=pending,
                 user_input="",
@@ -3758,14 +3461,11 @@ def continue_plan(req: ContinueRequest):
                     pending_plan=pending2,
                     notes=notes2,
                 )
-
-            # sinon on continue plus bas (validation SQL)
         else:
-            # direct sql
             sql = (llm.sql or "").strip()
             params = list(llm.params or [])
 
-    # ✅ Chemin NORMAL: continuation d’un plan (compte_id, projet_id, devise, etc.)
+
     sql, params, resolved, clarification, pending2, notes2 = continue_pending_plan(
         pending=req.pending_plan,
         user_input=req.user_input,
