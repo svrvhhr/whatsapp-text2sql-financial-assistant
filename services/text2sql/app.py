@@ -336,6 +336,44 @@ ANALYTICS_INVOICES_LIST_RE = re.compile(
     re.I
 )
 
+# ---------------- FACTURE ----------------
+UPDATE_FACTURE_STATUT_RE = re.compile(
+    r"\b(marque|met|mettre|passe|change)\b.*\bfacture\s*(\d+)\b.*\b(en|comme)?\s*(payee|payée|emise|émise)\b",
+    re.I
+)
+
+
+UPDATE_FACTURE_MONTANT_RE = re.compile(
+    r"\b(modifie|change|corrige)\b.*\bmontant\b.*\bfacture\s*(\d+)\b",
+    re.I
+)
+
+# ---------------- DEPENSE ----------------
+UPDATE_DEPENSE_DESCRIPTION_RE = re.compile(
+    r"\b(modifie|change)\b.*\bdescription\b.*\bd[eé]pense\s*(\d+)\b",
+    re.I
+)
+
+UPDATE_DEPENSE_TYPE_RE = re.compile(
+    r"\b(change|modifie)\b.*\btype\b.*\bd[eé]pense\s*(\d+)\b",
+    re.I
+)
+
+UPDATE_DEPENSE_MONTANT_RE = re.compile(
+    r"\b(corrige|modifie|change)\b.*\bmontant\b.*\bd[eé]pense\s*(\d+)\b",
+    re.I
+)
+
+UPDATE_DEPENSE_DATE_RE = re.compile(
+    r"\b(change|modifie)\b.*\bdate\b.*\bd[eé]pense\s*(\d+)\b",
+    re.I
+)
+
+# ---------------- PROJET ----------------
+UPDATE_PROJET_BUDGET_RE = re.compile(
+    r"\b(modifie|change)\b.*\bbudget\b.*\bprojet\b",
+    re.I
+)
 
 def _extract_year(text: str):
     m = re.search(r"\b(20\d{2})\b", text or "")
@@ -583,7 +621,7 @@ def ensure_schema_loaded(force: bool = False):
 # Depense type detection (keep your behavior)
 # =========================================================
 TYPE_DEPENSE_ALIASES = {
-    "restauration": ["restaurant", "resto", "repas", "déjeuner", "dejeuner", "dîner", "diner", "meal", "lunch", "dinner"],
+    "restauration": ["restauration","restaurant", "resto", "repas", "déjeuner", "dejeuner", "dîner", "diner", "meal", "lunch", "dinner"],
     "transport": ["transport", "taxi", "uber", "bolt", "train", "sncf", "metro", "bus", "avion", "flight", "parking", "péage", "peage", "carburant", "essence", "diesel"],
     "cloud": ["cloud", "aws", "amazon web services", "azure", "gcp", "google cloud", "ovh", "scaleway", "digitalocean", "heroku", "kubernetes"],
     "materiel": ["matériel", "materiel", "ordinateur", "pc", "laptop", "écran", "ecran", "clavier", "souris", "imprimante", "serveur", "router", "switch"],
@@ -1046,6 +1084,73 @@ def get_fx_rate(from_cur: str, to_cur: str, on_date: Optional[date] = None) -> O
     finally:
         conn.close()
 
+def get_depense_context(depense_id: int) -> Optional[Dict[str, Any]]:
+    conn = _pg_connect()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                  d.id AS depense_id,
+                  d.compte_id,
+                  cf.devise AS compte_devise,
+                  d.projet_id,
+                  p.entreprise_id
+                FROM depense d
+                JOIN compte_financier cf ON cf.id = d.compte_id
+                JOIN projet p ON p.id = d.projet_id
+                WHERE d.id = %s
+                LIMIT 1;
+            """, (depense_id,))
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def get_facture_context(facture_id: int) -> Optional[Dict[str, Any]]:
+    conn = _pg_connect()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                  f.id AS facture_id,
+                  f.projet_id,
+                  p.entreprise_id,
+                  f.devise
+                FROM facture f
+                JOIN projet p ON p.id = f.projet_id
+                WHERE f.id = %s
+                LIMIT 1;
+            """, (facture_id,))
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def get_projet_context(projet_id: int) -> Optional[Dict[str, Any]]:
+    conn = _pg_connect()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id AS projet_id, entreprise_id
+                FROM projet
+                WHERE id = %s
+                LIMIT 1;
+            """, (projet_id,))
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def extract_first_int(text: str) -> Optional[int]:
+    m = re.search(r"\b(\d{1,9})\b", text or "")
+    return int(m.group(1)) if m else None
+
+
+def extract_id_after_keyword(text: str, keyword: str) -> Optional[int]:
+    # ex: "facture 12", "dépense 45"
+    pat = rf"\b{re.escape(keyword)}\b\s*(?:n[°o]\s*)?(\d{{1,9}})\b"
+    m = re.search(pat, text or "", flags=re.I)
+    return int(m.group(1)) if m else None
 
 # =========================================================
 # Date parsing (generic)
@@ -1736,6 +1841,126 @@ INTENTS.update({
   },
 })
 
+INTENTS.update({
+    "UPDATE_FACTURE_STATUT": {
+        "operation": "UPDATE",
+        "table": "facture",
+        "required": ["entreprise_id", "facture_id", "statut"],
+        "template": """
+            UPDATE facture f
+            SET statut=%s,
+                date_paiement = CASE WHEN %s='PAYEE' THEN CURRENT_DATE ELSE NULL END,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE f.id=%s
+              AND EXISTS (
+                SELECT 1
+                FROM projet p
+                WHERE p.id=f.projet_id AND p.entreprise_id=%s
+              );
+        """.strip(),
+    },
+
+    "UPDATE_FACTURE_MONTANT": {
+        "operation": "UPDATE",
+        "table": "facture",
+        "required": ["entreprise_id", "facture_id", "montant", "devise"],
+        "template": """
+            UPDATE facture f
+            SET montant=%s,
+                devise=%s,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE f.id=%s
+              AND EXISTS (
+                SELECT 1
+                FROM projet p
+                WHERE p.id=f.projet_id AND p.entreprise_id=%s
+              );
+        """.strip(),
+    },
+
+    "UPDATE_DEPENSE_DESCRIPTION": {
+        "operation": "UPDATE",
+        "table": "depense",
+        "required": ["entreprise_id", "depense_id", "description"],
+        "template": """
+            UPDATE depense d
+            SET description=%s,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE d.id=%s
+              AND EXISTS (
+                SELECT 1
+                FROM projet p
+                WHERE p.id=d.projet_id AND p.entreprise_id=%s
+              );
+        """.strip(),
+    },
+
+    "UPDATE_DEPENSE_TYPE": {
+        "operation": "UPDATE",
+        "table": "depense",
+        "required": ["entreprise_id", "depense_id", "type_depense"],
+        "template": """
+            UPDATE depense d
+            SET type_depense=%s,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE d.id=%s
+              AND EXISTS (
+                SELECT 1
+                FROM projet p
+                WHERE p.id=d.projet_id AND p.entreprise_id=%s
+              );
+        """.strip(),
+    },
+
+    "UPDATE_DEPENSE_MONTANT": {
+        "operation": "UPDATE",
+        "table": "depense",
+        "required": ["entreprise_id", "depense_id", "montant", "devise"],
+        "template": """
+            UPDATE depense d
+            SET montant=%s,
+                devise=%s,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE d.id=%s
+              AND EXISTS (
+                SELECT 1
+                FROM projet p
+                WHERE p.id=d.projet_id AND p.entreprise_id=%s
+              );
+        """.strip(),
+    },
+
+    "UPDATE_DEPENSE_DATE": {
+        "operation": "UPDATE",
+        "table": "depense",
+        "required": ["entreprise_id", "depense_id", "date_depense"],
+        "template": """
+            UPDATE depense d
+            SET date_depense=%s,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE d.id=%s
+              AND EXISTS (
+                SELECT 1
+                FROM projet p
+                WHERE p.id=d.projet_id AND p.entreprise_id=%s
+              );
+        """.strip(),
+    },
+
+    "UPDATE_PROJET_BUDGET": {
+        "operation": "UPDATE",
+        "table": "projet",
+        "required": ["entreprise_id", "projet_id", "budget_total"],
+        "template": """
+        UPDATE projet p
+        SET budget_total=%s,
+            updated_at=CURRENT_TIMESTAMP
+        WHERE p.id=%s
+            AND p.entreprise_id=%s;
+        """.strip(),
+    },
+})
+
 # =========================================================
 # Few-shot (extended: depense + facture + transfert)
 # =========================================================
@@ -1819,6 +2044,79 @@ FEW_SHOT_BY_LANG["fr"] += [
     }},
 ]
 
+FEW_SHOT_BY_LANG["fr"] += [
+    # 1) Facture: changer statut
+    {"nl": "Marque la facture 12 comme PAYEE", "out": {
+        "mode": "plan",
+        "operation": "UPDATE",
+        "intent": "UPDATE_FACTURE_STATUT",
+        "entities": {"facture_id": 12, "statut": "PAYEE"},
+        "sql_template": INTENTS["UPDATE_FACTURE_STATUT"]["template"],
+        "template_params": []
+    }},
+
+    # 2) Facture: modifier montant (+ devise si mentionnée)
+    {"nl": "Corrige le montant de la facture 12 à 2500 EUR", "out": {
+        "mode": "plan",
+        "operation": "UPDATE",
+        "intent": "UPDATE_FACTURE_MONTANT",
+        "entities": {"facture_id": 12, "montant": 2500, "devise": "EUR"},
+        "sql_template": INTENTS["UPDATE_FACTURE_MONTANT"]["template"],
+        "template_params": []
+    }},
+
+    # 3) Dépense: modifier description
+    {"nl": "Modifie la description de la dépense 45 : \"Déjeuner client\"", "out": {
+        "mode": "plan",
+        "operation": "UPDATE",
+        "intent": "UPDATE_DEPENSE_DESCRIPTION",
+        "entities": {"depense_id": 45, "description": "Déjeuner client"},
+        "sql_template": INTENTS["UPDATE_DEPENSE_DESCRIPTION"]["template"],
+        "template_params": []
+    }},
+
+    # 4) Dépense: changer type_depense
+    {"nl": "Change le type de la dépense 45 en restauration", "out": {
+        "mode": "plan",
+        "operation": "UPDATE",
+        "intent": "UPDATE_DEPENSE_TYPE",
+        "entities": {"depense_id": 45, "type_depense": "restauration"},
+        "sql_template": INTENTS["UPDATE_DEPENSE_TYPE"]["template"],
+        "template_params": []
+    }},
+
+    # 5) Dépense: modifier montant (+ devise)
+    {"nl": "Corrige le montant de la dépense 45 à 60 EUR", "out": {
+        "mode": "plan",
+        "operation": "UPDATE",
+        "intent": "UPDATE_DEPENSE_MONTANT",
+        "entities": {"depense_id": 45, "montant": 60, "devise": "EUR"},
+        "sql_template": INTENTS["UPDATE_DEPENSE_MONTANT"]["template"],
+        "template_params": []
+    }},
+
+    # 6) Dépense: modifier date
+    {"nl": "Change la date de la dépense 45 au 2026-01-24", "out": {
+        "mode": "plan",
+        "operation": "UPDATE",
+        "intent": "UPDATE_DEPENSE_DATE",
+        "entities": {"depense_id": 45, "date_depense": "2026-01-24"},
+        "sql_template": INTENTS["UPDATE_DEPENSE_DATE"]["template"],
+        "template_params": []
+    }},
+
+    # 7) Projet: modifier budget_total
+    {"nl": "Mets à jour le budget du projet 2 à 150000", "out": {
+        "mode": "plan",
+        "operation": "UPDATE",
+        "intent": "UPDATE_PROJET_BUDGET",
+        "entities": {"projet_id": 2, "budget_total": 150000},
+        "sql_template": INTENTS["UPDATE_PROJET_BUDGET"]["template"],
+        "template_params": []
+    }},
+]
+
+
 def build_schema_summary(schema_bundle: Dict[str, Any]) -> Dict[str, Any]:
     tables = schema_bundle["tables"]
     fks = schema_bundle["fks"]
@@ -1851,6 +2149,16 @@ def build_llm_prompt(user_input: str, context: Dict[str, Any], force_plan: bool)
         "LIMIT_RULE": "Si l'utilisateur demande explicitement un top N / N dernières / N plus grandes, tu DOIS mettre LIMIT N. Sinon, tu NE mets PAS de LIMIT (le système injectera un LIMIT par défaut).",
         "PLACEHOLDERS": "Placeholders: %s uniquement",
     }
+    UPDATE_INTENTS = [
+  "UPDATE_FACTURE_STATUT",
+  "UPDATE_FACTURE_MONTANT",
+  "UPDATE_DEPENSE_DESCRIPTION",
+  "UPDATE_DEPENSE_TYPE",
+  "UPDATE_DEPENSE_MONTANT",
+  "UPDATE_DEPENSE_DATE",
+  "UPDATE_PROJET_BUDGET",
+]
+
 
     # give LLM the canonical templates to avoid hallucinations
     templates = {
@@ -1894,6 +2202,7 @@ INTENTS & DÉTECTION:
   Intents analytics autorisés:
   - {{", ".join(analytics_intents)}}
 
+  
 IMPORTANT:
 - Pour les intents ANALYTICS_* : tu retournes TOUJOURS un PLAN (operation=SELECT).
 - Pour les intents ANALYTICS_* : tu NE DOIS PAS produire de SQL (sql_template="" et template_params=[]).
@@ -1903,6 +2212,38 @@ IMPORTANT:
 - Ne retourne JAMAIS intent="AUTRE" pour une analytics.
 - Si l'entreprise n'est pas connue/ambigue (entreprise_id absent), retourne quand même le PLAN analytics:
       "entities":{{}}, et laisse le backend demander entreprise_id via clarification (ne demande pas "info").
+
+INTENTS D'ÉCRITURE (IMPORTANT):
+- Si l'utilisateur veut AJOUTER/INSÉRER une dépense -> intent=INSERT_DEPENSE
+- Si l'utilisateur veut CRÉER une facture -> intent=INSERT_FACTURE
+- Si l'utilisateur veut FAIRE un transfert interne -> intent=INSERT_TRANSFERT
+
+INTENTS DE MISE À JOUR (UPDATE):
+- Marquer une facture payée / émise -> UPDATE_FACTURE_STATUT
+- Modifier le montant d’une facture -> UPDATE_FACTURE_MONTANT
+- Modifier la description d’une dépense -> UPDATE_DEPENSE_DESCRIPTION
+- Modifier le type d’une dépense -> UPDATE_DEPENSE_TYPE
+- Modifier le montant d’une dépense -> UPDATE_DEPENSE_MONTANT
+- Modifier la date d’une dépense -> UPDATE_DEPENSE_DATE
+- Modifier le budget d’un projet -> UPDATE_PROJET_BUDGET
+
+IMPORTANT:
+- Pour les intents UPDATE_* : tu DOIS retourner un PLAN (mode=plan).
+- Pour UPDATE_* : retourne un PLAN avec sql_template = template canonique correspondant. Le backend exécute ce template.
+- Le SQL UPDATE est entièrement géré par le backend.
+
+- Si l'utilisateur demande une MODIFICATION (update) -> intent UPDATE_* (PLAN)
+  Intents update autorisés:
+  - {", ".join(UPDATE_INTENTS)}
+
+RÈGLES UPDATE:
+- Pour UPDATE_* : retourne TOUJOURS un PLAN (operation=UPDATE).
+- Pour UPDATE_* : sql_template = template canonique correspondant (pas vide).
+- Place les champs dans entities :
+  - facture_id / depense_id / projet_id (selon le cas)
+  - et la valeur à modifier (statut, montant+devise, description, type_depense, date_depense, budget_total)
+
+
 
 
 
@@ -1930,7 +2271,7 @@ PLAN:
 {{
   "mode":"plan",
   "operation":"SELECT|INSERT|UPDATE|DELETE|UNKNOWN",
-  "intent":"INSERT_DEPENSE|INSERT_FACTURE|INSERT_TRANSFERT|SELECT_PROJECTS|ANALYTICS_*|AUTRE",
+  "intent":"INSERT_DEPENSE|INSERT_FACTURE|INSERT_TRANSFERT|SELECT_PROJECTS|ANALYTICS_*|UPDATE_*|AUTRE",
   "entities":{{ ... }},
   "sql_template":"SQL avec %s OU vide si ANALYTICS_*",
   "template_params":[]
@@ -2096,6 +2437,33 @@ def detect_analytics_intent(user_input: str) -> Optional[str]:
     # -------------------------------------------------------
     # 3) Rien trouvé
     # -------------------------------------------------------
+    return None
+
+
+def detect_update_intent(user_input: str) -> Optional[str]:
+    ui = norm_txt(user_input)
+
+    if UPDATE_FACTURE_STATUT_RE.search(ui):
+        return "UPDATE_FACTURE_STATUT"
+
+    if UPDATE_FACTURE_MONTANT_RE.search(ui):
+        return "UPDATE_FACTURE_MONTANT"
+
+    if UPDATE_DEPENSE_DESCRIPTION_RE.search(ui):
+        return "UPDATE_DEPENSE_DESCRIPTION"
+
+    if UPDATE_DEPENSE_TYPE_RE.search(ui):
+        return "UPDATE_DEPENSE_TYPE"
+
+    if UPDATE_DEPENSE_MONTANT_RE.search(ui):
+        return "UPDATE_DEPENSE_MONTANT"
+
+    if UPDATE_DEPENSE_DATE_RE.search(ui):
+        return "UPDATE_DEPENSE_DATE"
+
+    if UPDATE_PROJET_BUDGET_RE.search(ui):
+        return "UPDATE_PROJET_BUDGET"
+
     return None
 
 
@@ -2506,6 +2874,336 @@ def continue_pending_plan(
 
         notes.append("SELECT_PROJECTS resolved.")
         return sql, params, {}, Clarification(needed=False), pending, notes
+
+    # -----------------------------------------------------
+    # INTENTS: UPDATE_* — SQL canonique backend + clarifications
+    # -----------------------------------------------------
+    if intent and intent.startswith("UPDATE_"):
+        # 0) entreprise_id obligatoire (comme analytics)
+        eid = context.get("entreprise_id") or filled.get("entreprise_id")
+        if not eid:
+            uid = context.get("user_id")
+            if uid:
+                ents = list_user_enterprises(int(uid))
+                return None, [], {}, _clarify_pick("entreprise", "", ents, lang), pending, notes
+
+            return None, [], {}, Clarification(
+                needed=True,
+                entity="entreprise",
+                field="entreprise_id",
+                query="",
+                suggestions=[],
+                message=t(lang, "need_entreprise"),
+            ), pending, notes
+
+        eid = int(eid)
+        context["entreprise_id"] = eid
+        pending.filled["entreprise_id"] = eid
+
+        original = context.get("original_user_input") or ""
+        ui_norm = norm_txt(original)
+
+        # -------------------------
+        # UPDATE_FACTURE_STATUT
+        # -------------------------
+        if intent == "UPDATE_FACTURE_STATUT":
+            if "facture_id" not in filled:
+                fid = extract_id_after_keyword(original, "facture") or extract_first_int(original)
+                if not fid:
+                    return None, [], {}, Clarification(
+                        needed=True, entity="facture", field="facture_id",
+                        message="Quelle est l’ID de la facture à mettre à jour ? (ex: 12)"
+                    ), pending, notes
+                filled["facture_id"] = int(fid)
+                pending.filled = filled
+
+            # statut
+            statut = (filled.get("statut") or "").strip().upper()
+            if not statut:
+                # essaie d’inférer depuis le texte
+                if re.search(r"\bpayee|payée|paid\b", ui_norm, re.I):
+                    statut = "PAYEE"
+                elif re.search(r"\bemise|émise|issued\b", ui_norm, re.I):
+                    statut = "EMISE"
+
+            if statut not in ("PAYEE", "EMISE"):
+                return None, [], {}, Clarification(
+                    needed=True, entity="statut", field="statut",
+                    message="Quel statut ? Réponds: PAYEE ou EMISE."
+                ), pending, notes
+
+            ctxf = get_facture_context(int(filled["facture_id"]))
+            if not ctxf:
+                raise HTTPException(404, f"Facture {filled['facture_id']} introuvable.")
+            if int(ctxf["entreprise_id"]) != eid:
+                raise HTTPException(403, "Facture hors de ton entreprise (refus).")
+
+            sql = INTENTS[intent]["template"]
+            params = [statut, statut, int(filled["facture_id"]), eid]
+            return sql, params, {}, Clarification(needed=False), pending, notes
+
+        # -------------------------
+        # UPDATE_FACTURE_MONTANT
+        # -------------------------
+        if intent == "UPDATE_FACTURE_MONTANT":
+            if "facture_id" not in filled:
+                fid = extract_id_after_keyword(original, "facture") or extract_first_int(original)
+                if not fid:
+                    return None, [], {}, Clarification(
+                        needed=True, entity="facture", field="facture_id",
+                        message="Quelle est l’ID de la facture ? (ex: 12)"
+                    ), pending, notes
+                filled["facture_id"] = int(fid)
+                pending.filled = filled
+
+            montant, devise = parse_amount_currency(original)
+            if filled.get("montant") is not None:
+                montant = float(filled["montant"])
+            if filled.get("devise"):
+                devise = str(filled["devise"]).upper()
+
+            if montant is None:
+                return None, [], {}, Clarification(
+                    needed=True, entity="montant", field="montant",
+                    message=t(lang, "need_amount")
+                ), pending, notes
+            if not devise:
+                return None, [], {}, Clarification(
+                    needed=True, entity="devise", field="devise",
+                    suggestions=[{"option": 1, "nom": "EUR"}, {"option": 2, "nom": "DZD"}, {"option": 3, "nom": "AED"}, {"option": 4, "nom": "USD"}],
+                    message=t(lang, "need_currency")
+                ), pending, notes
+
+            ctxf = get_facture_context(int(filled["facture_id"]))
+            if not ctxf:
+                raise HTTPException(404, f"Facture {filled['facture_id']} introuvable.")
+            if int(ctxf["entreprise_id"]) != eid:
+                raise HTTPException(403, "Facture hors de ton entreprise (refus).")
+
+            sql = INTENTS[intent]["template"]
+            params = [float(montant), str(devise).upper(), int(filled["facture_id"]), eid]
+            return sql, params, {}, Clarification(needed=False), pending, notes
+
+        # -------------------------
+        # UPDATE_DEPENSE_DESCRIPTION
+        # -------------------------
+        if intent == "UPDATE_DEPENSE_DESCRIPTION":
+            if "depense_id" not in filled:
+                did = extract_id_after_keyword(original, "depense") or extract_id_after_keyword(original, "dépense") or extract_first_int(original)
+                if not did:
+                    return None, [], {}, Clarification(
+                        needed=True, entity="depense", field="depense_id",
+                        message="Quelle est l’ID de la dépense ? (ex: 45)"
+                    ), pending, notes
+                filled["depense_id"] = int(did)
+                pending.filled = filled
+
+            desc = (filled.get("description") or "").strip()
+            if not desc:
+                m = re.search(r":\s*['\"“”]?(.*?)['\"“”]?\s*$", original)
+                if m:
+                    desc = m.group(1).strip()
+                m = re.search(r"\b(en|to)\b\s+(.+)$", original, flags=re.I)
+                if m:
+                    desc = m.group(2).strip().strip('"“”')
+
+
+            if not desc:
+                return None, [], {}, Clarification(
+                    needed=True, entity="description", field="description",
+                    message="Quelle nouvelle description ? (ex: Déjeuner client)"
+                ), pending, notes
+
+            ctxd = get_depense_context(int(filled["depense_id"]))
+            if not ctxd:
+                raise HTTPException(404, f"Dépense {filled['depense_id']} introuvable.")
+            if int(ctxd["entreprise_id"]) != eid:
+                raise HTTPException(403, "Dépense hors de ton entreprise (refus).")
+
+            sql = INTENTS[intent]["template"]
+            params = [desc, int(filled["depense_id"]), eid]
+            return sql, params, {}, Clarification(needed=False), pending, notes
+
+        # -------------------------
+        # UPDATE_DEPENSE_TYPE
+        # -------------------------
+        if intent == "UPDATE_DEPENSE_TYPE":
+            if "depense_id" not in filled:
+                did = extract_id_after_keyword(original, "depense") or extract_id_after_keyword(original, "dépense") or extract_first_int(original)
+                if not did:
+                    return None, [], {}, Clarification(
+                        needed=True, entity="depense", field="depense_id",
+                        message="Quelle est l’ID de la dépense ? (ex: 45)"
+                    ), pending, notes
+                filled["depense_id"] = int(did)
+                pending.filled = filled
+
+            td = (filled.get("type_depense") or "").strip().lower()
+            if not td:
+                # essaie d’inférer depuis le texte
+                td = detect_type_depense_from_text(original) or ""
+
+            # contrôle strict: doit être une clé connue
+            if td not in TYPE_DEPENSE_ALIASES.keys():
+                return None, [], {}, Clarification(
+                    needed=True, entity="type_depense", field="type_depense",
+                    message="Quel type ? (ex: restauration, transport, cloud, logiciel, telecom, marketing, formation, services, frais_bancaires, autre)"
+                ), pending, notes
+
+            ctxd = get_depense_context(int(filled["depense_id"]))
+            if not ctxd:
+                raise HTTPException(404, f"Dépense {filled['depense_id']} introuvable.")
+            if int(ctxd["entreprise_id"]) != eid:
+                raise HTTPException(403, "Dépense hors de ton entreprise (refus).")
+
+            sql = INTENTS[intent]["template"]
+            params = [td, int(filled["depense_id"]), eid]
+            return sql, params, {}, Clarification(needed=False), pending, notes
+
+        # -------------------------
+        # UPDATE_DEPENSE_DATE
+        # -------------------------
+        if intent == "UPDATE_DEPENSE_DATE":
+            if "depense_id" not in filled:
+                did = extract_id_after_keyword(original, "depense") or extract_id_after_keyword(original, "dépense") or extract_first_int(original)
+                if not did:
+                    return None, [], {}, Clarification(
+                        needed=True, entity="depense", field="depense_id",
+                        message="Quelle est l’ID de la dépense ? (ex: 45)"
+                    ), pending, notes
+                filled["depense_id"] = int(did)
+                pending.filled = filled
+
+            ddep = parse_any_date(original)
+            if filled.get("date_depense"):
+                try:
+                    ddep = parse_any_date(str(filled["date_depense"]))
+                except Exception:
+                    pass
+
+            if not ddep:
+                return None, [], {}, Clarification(
+                    needed=True, entity="date", field="date_depense",
+                    message="Quelle nouvelle date ? (ex: 2026-01-24)"
+                ), pending, notes
+
+            ctxd = get_depense_context(int(filled["depense_id"]))
+            if not ctxd:
+                raise HTTPException(404, f"Dépense {filled['depense_id']} introuvable.")
+            if int(ctxd["entreprise_id"]) != eid:
+                raise HTTPException(403, "Dépense hors de ton entreprise (refus).")
+
+            sql = INTENTS[intent]["template"]
+            params = [ddep.isoformat(), int(filled["depense_id"]), eid]
+            return sql, params, {}, Clarification(needed=False), pending, notes
+
+        # -------------------------
+        # UPDATE_DEPENSE_MONTANT (contrôle devise vs compte)
+        # -------------------------
+        if intent == "UPDATE_DEPENSE_MONTANT":
+            if "depense_id" not in filled:
+                did = extract_id_after_keyword(original, "depense") or extract_id_after_keyword(original, "dépense") or extract_first_int(original)
+                if not did:
+                    return None, [], {}, Clarification(
+                        needed=True, entity="depense", field="depense_id",
+                        message="Quelle est l’ID de la dépense ? (ex: 45)"
+                    ), pending, notes
+                filled["depense_id"] = int(did)
+                pending.filled = filled
+
+            montant, devise = parse_amount_currency(original)
+            if filled.get("montant") is not None:
+                montant = float(filled["montant"])
+            if filled.get("devise"):
+                devise = str(filled["devise"]).upper()
+
+            if montant is None:
+                return None, [], {}, Clarification(
+                    needed=True, entity="montant", field="montant",
+                    message=t(lang, "need_amount")
+                ), pending, notes
+
+            ctxd = get_depense_context(int(filled["depense_id"]))
+            if not ctxd:
+                raise HTTPException(404, f"Dépense {filled['depense_id']} introuvable.")
+            if int(ctxd["entreprise_id"]) != eid:
+                raise HTTPException(403, "Dépense hors de ton entreprise (refus).")
+
+            compte_dev = (ctxd.get("compte_devise") or "").upper()
+            if not devise:
+                # devise par défaut = devise du compte (comme INSERT)
+                devise = compte_dev
+
+            devise = str(devise).upper()
+
+            # refus si devise incompatible compte
+            if compte_dev and devise != compte_dev:
+                raise HTTPException(
+                    400,
+                    f"Correction impossible en {devise}. Le compte de la dépense est en {compte_dev}. "
+                    f"Reformule en {compte_dev}."
+                )
+
+            sql = INTENTS[intent]["template"]
+            params = [float(montant), devise, int(filled["depense_id"]), eid]
+            return sql, params, {}, Clarification(needed=False), pending, notes
+
+        # -------------------------
+        # UPDATE_PROJET_BUDGET
+        # -------------------------
+        if intent == "UPDATE_PROJET_BUDGET":
+            if "projet_id" not in filled:
+                pq = (entities.get("projet_query") or "").strip()
+                if pq:
+                    matches = resolve_by_name("projet", pq, eid, topk=RESOLVE_TOPK)
+                    if len(matches) != 1:
+                        return None, [], {}, _clarify_pick("projet", pq, matches, lang), pending, notes
+                    filled["projet_id"] = int(matches[0]["id"])
+                    pending.filled = filled
+                else:
+                    pid = extract_id_after_keyword(original, "projet") or extract_id_after_keyword(original, "project") or extract_first_int(original)
+                    if not pid:
+                        return None, [], {}, Clarification(
+                            needed=True, entity="projet", field="projet_id",
+                            message="Quel projet ? Donne l’ID (ex: projet 2)."
+                        ), pending, notes
+                    filled["projet_id"] = int(pid)
+                    pending.filled = filled
+
+            # budget_total
+            # on accepte: "à 150000", "budget ... 150000", etc.
+            bt = filled.get("budget_total")
+            if bt is None:
+                m = re.search(r"\b(à|a)\s*(\d{1,3}(?:[ \u00a0]\d{3})*|\d+)(?:[.,](\d{1,2}))?\b", original, flags=re.I)
+                if m:
+                    int_part = m.group(2).replace("\u00a0", " ").replace(" ", "")
+                    dec_part = m.group(3)
+                    bt = float(int_part) + (float(dec_part) / (10 ** len(dec_part)) if dec_part else 0.0)
+
+            if bt is None:
+                return None, [], {}, Clarification(
+                    needed=True, entity="budget", field="budget_total",
+                    message="Quel nouveau budget_total ? (ex: 150000)"
+                ), pending, notes
+
+            ctxp = get_projet_context(int(filled["projet_id"]))
+            if not ctxp:
+                raise HTTPException(404, f"Projet {filled['projet_id']} introuvable.")
+            if int(ctxp["entreprise_id"]) != eid:
+                raise HTTPException(403, "Projet hors de ton entreprise (refus).")
+
+            sql = INTENTS[intent]["template"]
+            params = [float(bt), int(filled["projet_id"]), eid]
+            return sql, params, {}, Clarification(needed=False), pending, notes
+
+
+        # si un UPDATE_* tombe ici => intent non géré
+        return None, [], {}, Clarification(
+            needed=True,
+            entity=None,
+            field=None,
+            message=f"Intent update non supportée: {intent}",
+        ), pending, notes
 
     # -----------------------------------------------------
     # INTENTS: ANALYTICS_* (NEW) — SQL canonique backend
@@ -3118,6 +3816,12 @@ def convert(req: ConvertRequest):
     channel=context.get("channel"),
 )
 
+    # 1) Analytics bypass
+    analytics_intent = detect_analytics_intent(req.user_input)
+
+    # 2) Update bypass (fallback rule-based)
+    update_intent = detect_update_intent(req.user_input) if not analytics_intent else None
+
     if analytics_intent:
         llm_obj = {
             "mode": "plan",
@@ -3128,11 +3832,24 @@ def convert(req: ConvertRequest):
             "template_params": [],
         }
         llm_ms = 0
+
+    elif update_intent:
+        llm_obj = {
+            "mode": "plan",
+            "operation": "UPDATE",
+            "intent": update_intent,
+            "entities": {},
+            "sql_template": INTENTS[update_intent]["template"],
+            "template_params": [],
+        }
+        llm_ms = 0
+
     else:
         t0 = time.time()
         prompt = build_llm_prompt(req.user_input, context, force_plan=force_plan)
         llm_obj = call_gpt(prompt)
         llm_ms = int((time.time() - t0) * 1000)
+
     try:
         llm: LLMOutput = parse_llm_output(llm_obj)
     except (ValidationError, Exception) as e:

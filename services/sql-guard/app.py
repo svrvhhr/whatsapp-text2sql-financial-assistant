@@ -78,6 +78,12 @@ _FORBIDDEN_FUNCTIONS = {
     "dblink",
 }
 
+UPDATE_ALLOWED_COLUMNS = {
+    "depense": {"type_depense", "description", "date_depense"},   # éventuellement "montant" mais c’est sensible
+    "facture": {"statut", "date_paiement", "reference"},
+    "transfert_interne": {"date_transfert", "description"},
+}
+
 # =========================================================
 # Logging
 # =========================================================
@@ -1029,11 +1035,16 @@ def check(plan: SQLPlan):
         # UPDATE checks (limited, still useful)
         if isinstance(node, exp.Update):
             target_table, set_map = _extract_update_target(node)
-            # For professional safety, require WHERE already handled above.
-            # You can add deeper validations later when you standardize update templates.
-            if target_table in ("depense", "transfert_interne", "facture"):
-                # Optional: mark as needs_approval unless you implement full mapping
-                reasons.append(f"Validation métier: UPDATE sur {target_table} nécessite validation avancée (mettre en approval).")
+
+            if target_table in UPDATE_ALLOWED_COLUMNS:
+                allowed_cols = UPDATE_ALLOWED_COLUMNS[target_table]
+                updated_cols = set(set_map.keys())
+
+                forbidden = sorted(list(updated_cols - allowed_cols))
+                if forbidden:
+                    reasons.append(
+                        f"Validation métier: colonnes UPDATE interdites sur {target_table}: {', '.join(forbidden)}"
+                    )
 
     # -------------------------
     # Decision

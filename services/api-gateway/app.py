@@ -445,6 +445,18 @@ DB_VERBS = [
 ]
 
 
+def _ensure_ctx(plan: Dict[str, Any], actor_id: str) -> Dict[str, Any]:
+    ctx = dict(plan.get("context") or {})
+    ctx["actor_id"] = actor_id 
+    if plan.get("entreprise_id") is not None:
+        ctx["entreprise_id"] = plan["entreprise_id"]
+    if plan.get("role") is not None:
+        ctx["role"] = plan["role"]
+    plan["context"] = ctx
+    return ctx
+
+
+
 def route_message(text: str) -> Tuple[str, Optional[str]]:
     t = (text or "").strip().lower()
     SQL_DIRECT_RE = re.compile(r"^\s*(select|insert|update|delete)\b", re.I)
@@ -796,6 +808,7 @@ def _simulate_execute_plan(actor_id: str, user_text: str, plan: Dict[str, Any]) 
     ctx = plan.get("context") or {}
     plan["entreprise_id"] = plan.get("entreprise_id") or ctx.get("entreprise_id")
     plan["role"] = plan.get("role") or ctx.get("role")
+    ctx = _ensure_ctx(plan, actor_id) 
 
     guard = post_json(f"{SQL_GUARD_URL.rstrip('/')}/check", plan)
     if not guard.get("allowed", False):
@@ -1210,10 +1223,12 @@ def _run_pipeline(actor_id: str, user_text: str, original_user_text: str) -> Non
         _send_user_message(actor_id, original_user_text, error_message=f"Erreur interne: {e}")
 
 
+
 def _execute_plan(actor_id: str, user_text: str, plan: Dict[str, Any]) -> None:
     ctx = plan.get("context") or {}
     plan["entreprise_id"] = plan.get("entreprise_id") or ctx.get("entreprise_id")
     plan["role"] = plan.get("role") or ctx.get("role")
+    ctx = _ensure_ctx(plan, actor_id) 
 
     guard = post_json(f"{SQL_GUARD_URL.rstrip('/')}/check", plan)
     if not guard.get("allowed", False):
