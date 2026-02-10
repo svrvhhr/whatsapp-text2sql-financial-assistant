@@ -16,7 +16,12 @@ from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
-from streamlit import json
+
+from openpyxl import load_workbook
+from datetime import datetime, date
+
+from PyPDF2 import PdfReader
+
 
 # =========================================================
 # ENV
@@ -65,6 +70,95 @@ SQL_KEYWORDS_RE = re.compile(r"\b(select|insert|update|delete|drop|truncate|alte
 # =========================================================
 _PENDING: Dict[str, Dict[str, Any]] = {}
 _PENDING_LOCK = Lock()
+
+# =========================================================
+# In-memory pending imports (actor_id -> payload)
+# =========================================================
+
+_PENDING_IMPORT: Dict[str, Dict[str, Any]] = {}
+_PENDING_IMPORT_LOCK = Lock()
+
+def _import_set(actor_id: str, items: List[Dict[str, Any]]) -> None:
+    with _PENDING_IMPORT_LOCK:
+        _PENDING_IMPORT[actor_id] = {
+            "ts": time.time(),
+            "items": items,
+            "idx": 0,
+            "active": False,
+        }
+
+def _import_get(actor_id: str) -> Optional[Dict[str, Any]]:
+    with _PENDING_IMPORT_LOCK:
+        return _PENDING_IMPORT.get(actor_id)
+
+def _import_clear(actor_id: str) -> None:
+    with _PENDING_IMPORT_LOCK:
+        _PENDING_IMPORT.pop(actor_id, None)
+
+def _import_build_cmd(it: Dict[str, Any]) -> str:
+    if it.get("depense_id"):
+        return (
+            f"Met à jour la dépense {it['depense_id']} "
+            f"avec montant {it.get('montant')} {it.get('devise') or ''} "
+            f"date {it.get('date') or ''} "
+            f"description {it.get('description') or ''}"
+        )
+
+    return (
+        f"Insère une dépense {it.get('type_depense') or 'Autre'} "
+        f"de {it.get('montant')} {it.get('devise') or 'EUR'} "
+        f"pour le projet \"{it.get('projet') or ''}\" "
+        f"payée depuis le compte \"{it.get('compte') or ''}\" "
+        f"le {it.get('date') or ''}. "
+        f"Description : {it.get('description') or ''}."
+    )
+
+
+def _import_process_next(actor_id: str) -> None:
+    """
+    Traite 1 seule ligne. Si clarification/confirmation: s’arrête et attend l’utilisateur.
+    Quand la ligne est terminée, passe à la suivante automatiquement.
+    """
+    imp = _import_get(actor_id)
+    if not imp or not imp.get("active"):
+        return
+
+    items = imp.get("items") or []
+    idx = int(imp.get("idx") or 0)
+
+    if idx >= len(items):
+        send_whatsapp_via_twilio(actor_id, f"✅ Import terminé. Lignes traitées: {len(items)}")
+        _import_clear(actor_id)
+        return
+
+    it = items[idx]
+    cmd = _import_build_cmd(it)
+
+    # 🔥 IMPORTANT : on exécute UNE SEULE ligne via le pipeline normal
+    # Si clarification/confirmation est requise, _run_pipeline s’arrêtera et stockera l’état.
+    _run_pipeline(actor_id=actor_id, user_text=cmd, original_user_text=cmd)
+
+    # On n’incrémente PAS idx ici, parce que la ligne peut être en attente de clarification/confirmation.
+    # idx sera incrémenté seulement après exécution réussie (voir étape 3).
+
+
+def fetch_twilio_media(url: str) -> bytes:
+    r = requests.get(
+        url,
+        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+        timeout=20
+    )
+    r.raise_for_status()
+    return r.content
+
+def ux_ack(kind: str) -> str:
+    return {
+        "processing": "⏳ Requête reçue. Je traite et je reviens vers toi…",
+        "continuing": "✅ Reçu. Je continue…",
+        "executing": "✅ Confirmation reçue. J’exécute la requête…",
+        "importing": "✅ OK. J’importe les lignes…",
+    }.get(kind, "⏳ OK.")
+
 
 # =========================================================
 # In-memory pending clarifications (actor_id -> payload)
@@ -234,6 +328,78 @@ def _save_temp_file(data: bytes, filename: str, content_type: str) -> str:
             "content_type": content_type,
         }
     return file_id
+
+def download_twilio_media(url: str) -> Tuple[bytes, str]:
+    if not url:
+        raise ValueError("MediaUrl missing")
+    r = requests.get(
+        url,
+        auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+        timeout=20,
+    )
+    r.raise_for_status()
+    ct = r.headers.get("Content-Type", "") or ""
+    return r.content, ct
+
+def parse_xlsx_expenses(xlsx_bytes: bytes) -> List[Dict[str, Any]]:
+    wb = load_workbook(filename=io.BytesIO(xlsx_bytes), data_only=True)
+    ws = wb.active
+
+    # 1ère ligne = header
+    headers = []
+    for cell in ws[1]:
+        h = (str(cell.value).strip().lower() if cell.value is not None else "")
+        headers.append(h)
+
+    def get(row, key, default=None):
+        if key not in headers:
+            return default
+        idx = headers.index(key) + 1
+        return row[idx-1].value
+
+    rows = []
+    for r in ws.iter_rows(min_row=2, values_only=False):
+        # lignes vides
+        if all(c.value is None for c in r):
+            continue
+
+        depense_id = get(r, "depense_id") or get(r, "id")  # optionnel
+        montant = get(r, "montant")
+        projet = get(r, "projet")
+        compte = get(r, "compte")
+        devise = get(r, "devise")
+        type_depense = get(r, "type_depense")
+        description = get(r, "description")
+        d = get(r, "date") or get(r, "date_depense")
+
+        # normaliser date
+        if isinstance(d, datetime):
+            d = d.date()
+        if isinstance(d, date):
+            d = d.isoformat()
+        elif d is not None:
+            d = str(d)
+
+        rows.append({
+            "depense_id": str(depense_id).strip() if depense_id else None,
+            "projet": str(projet).strip() if projet else None,
+            "compte": str(compte).strip() if compte else None,
+            "montant": float(montant) if montant is not None else None,
+            "devise": str(devise).strip() if devise else None,
+            "type_depense": str(type_depense).strip() if type_depense else None,
+            "description": str(description).strip() if description else None,
+            "date": d,
+        })
+    return rows
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    parts = []
+    for p in reader.pages[:20]:  # limite pages (sécurité)
+        t = p.extract_text() or ""
+        if t.strip():
+            parts.append(t)
+    return "\n".join(parts).strip()
 
 
 # =========================================================
@@ -528,13 +694,18 @@ def build_confirmation_message(plan: Dict[str, Any]) -> str:
         excerpt = excerpt[:220] + "..."
 
     return (
-        "⚠️ Action sensible détectée.\n"
-        f"Opération: {op}\n"
-        f"Aperçu: {excerpt}\n\n"
-        "Réponds:\n"
-        "✅ OUI pour confirmer\n"
-        "❌ NON pour annuler"
-    )
+            f"⚠️ Action {op} détectée.\n"
+            "Confirmer l’exécution ?\n"
+            "✅ OUI  |  ❌ NON"
+        )
+    # return (
+    #     "⚠️ Confirmation requise\n"
+    #     # f"Opération: {op}\n"
+    #     # f"Aperçu: {excerpt}\n\n"
+    #     "Réponds:\n"
+    #     "✅ OUI pour confirmer\n"
+    #     "❌ NON pour annuler"
+    # )
 
 
 # =========================================================
@@ -547,7 +718,7 @@ def _coerce_none(v: Any) -> Any:
 def fallback_format_select(columns: List[str], rows: List[List[Any]], max_rows: int = 5) -> str:
     if not rows:
         return "✅ Aucun résultat."
-    lines = ["📊 Résultats", ""]
+    lines = ["📊 Voici ce que j’ai trouvé :", ""]
     for idx, r in enumerate(rows[:max_rows], start=1):
         parts = []
         for i, c in enumerate(columns[:4]):
@@ -639,12 +810,8 @@ def render_clarification_message(state: Dict[str, Any]) -> str:
         lines = [
             header.strip(),
             "",
-            f"Je ne trouve aucun {entity} qui ressemble à “{query}”.",
-            "Peux-tu préciser ?",
-            "",
-            "Tu peux répondre :",
-            "• un nom plus précis",
-            "• Annuler",
+            f"❓ Je ne trouve pas de {entity} correspondant à “{query}”.\n"
+            "Réponds avec un nom plus précis, ou tape *Annuler*."
         ]
         return "\n".join(lines)
 
@@ -659,7 +826,7 @@ def render_clarification_message(state: Dict[str, Any]) -> str:
     lines += [
         "",
         "Réponds avec le numéro (ex: 1).",
-        "Ou réponds : Annuler / Voir la liste / Modifier ma demande",
+        "Ou réponds : Annuler | Voir la liste | Modifier ma demande",
     ]
     return "\n".join(lines)
 
@@ -776,6 +943,16 @@ def _simulate_send_select(actor_id: str, user_text: str, plan: Dict[str, Any], r
 
 def _simulate_send_write(actor_id: str, user_text: str, plan: Dict[str, Any], result: Dict[str, Any]) -> str:
     op = (result.get("operation") or plan.get("operation") or "").upper()
+    n = result.get("affected_rows") or 0
+    if op == "INSERT":
+        msg = f"✅ Ajout effectué. {n} élément(s) créé(s)."
+    elif op == "UPDATE":
+        msg = f"✅ Mise à jour effectuée. {n} élément(s) modifié(s)."
+    elif op == "DELETE":
+        msg = f"✅ Suppression effectuée. {n} élément(s) supprimé(s)."
+    else:
+        msg = f"✅ Terminé. {n} ligne(s) affectée(s)."
+
     writer_payload = {
         "request_id": str(uuid.uuid4()),
         "lang": detect_lang(user_text),
@@ -784,7 +961,7 @@ def _simulate_send_write(actor_id: str, user_text: str, plan: Dict[str, Any], re
         "operation": op or "EXECUTED",
         "rows": [],
         "columns": [],
-        "user_message": f"✅ {op} exécuté. affected_rows={result.get('affected_rows')}",
+        "user_message": msg,
     }
     return call_response_writer(writer_payload) or f"✅ {op} exécuté. affected_rows={result.get('affected_rows')}"
 def post_json_safe(url: str, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
@@ -983,17 +1160,18 @@ def simulate(payload: SimulateIn):
             return {"reply": "✅ Annulé. Rien n’a été exécuté."}
 
         if _CONFIRM_YES.match(user_text):
-            try:
-                plan = pending["plan"]
-                ctx = plan.get("context") or {}
-                ctx["confirmed"] = True
-                plan["context"] = ctx
-                reply = _simulate_execute_plan(actor_id, pending.get("user_text") or plan.get("user_input") or "", plan)
-                return {"reply": reply}
-            except Exception as e:
-                return {"reply": f"❌ Erreur interne: {e}"}
-            finally:
-                _pending_clear(actor_id)
+            # on passe l’import en mode actif
+            with _PENDING_IMPORT_LOCK:
+                cur = _PENDING_IMPORT.get(actor_id)
+                if cur:
+                    cur["active"] = True
+                    cur["idx"] = int(cur.get("idx") or 0)
+
+            # ack = PlainTextResponse(twiml_message("✅ OK. J’importe les lignes…"), media_type="application/xml", status_code=200)
+
+            threading.Thread(target=_import_process_next, args=(actor_id,), daemon=True).start()
+            return {"reply": "✅ OK. J’importe les lignes…"}
+
 
         return {"reply": "Je n’ai pas compris. Réponds OUI pour confirmer ou NON/ANNULER pour annuler."}
 
@@ -1014,16 +1192,18 @@ def whatsapp_webhook_get():
 
 @app.post("/whatsapp/webhook", response_class=PlainTextResponse)
 def whatsapp_webhook(
-    Body: str = Form(...),
+    Body: str = Form(""),
     From: str = Form(...),
     ProfileName: Optional[str] = Form(None),
+    NumMedia: Optional[str] = Form("0"),
+    MediaUrl0: Optional[str] = Form(None),
+    MediaContentType0: Optional[str] = Form(None),
 ):
+
     user_text = (Body or "").strip()
     actor_id = normalize_whatsapp_number(From)
 
-    if not user_text:
-        return PlainTextResponse(twiml_message("Message vide."), media_type="application/xml", status_code=200)
-
+    
     # Security prefilter
     if SQL_INJECTION_MARKERS_RE.search(user_text):
         return PlainTextResponse(
@@ -1031,6 +1211,111 @@ def whatsapp_webhook(
             media_type="application/xml",
             status_code=200,
         )
+
+    # 0bis) Import confirmation flow (XLSX batch)
+    imp = _import_get(actor_id)
+    if imp:
+        if _CONFIRM_NO.match(user_text) or _CMD_CANCEL.match(user_text):
+            _import_clear(actor_id)
+            return PlainTextResponse(twiml_message("✅ Import annulé."), media_type="application/xml")
+
+        if _CONFIRM_YES.match(user_text):
+            ack = PlainTextResponse(twiml_message("✅ OK. J’importe les lignes…"), media_type="application/xml", status_code=200)
+
+            def import_job():
+                try:
+                    items = imp.get("items") or []
+                    # stratégie simple : pour chaque ligne -> message texte -> pipeline normal
+                    for it in items:
+                        # si depense_id => update, sinon insert
+                        if it.get("depense_id"):
+                            cmd = (
+                                f"Met à jour la dépense {it['depense_id']} "
+                                f"avec montant {it.get('montant')} {it.get('devise') or ''} "
+                                f"date {it.get('date') or ''} "
+                                f"description {it.get('description') or ''}"
+                            )
+                        else:
+                            cmd = (
+                                f"Insère une dépense {it.get('type_depense') or 'Autre'} "
+                                f"de {it.get('montant')} {it.get('devise') or 'EUR'} "
+                                f"pour le projet \"{it.get('projet') or ''}\" "
+                                f"payée depuis le compte \"{it.get('compte') or ''}\" "
+                                f"le {it.get('date') or ''}. "
+                                f"Description : {it.get('description') or ''}."
+                            )
+                        _run_pipeline(actor_id=actor_id, user_text=cmd, original_user_text=cmd)
+
+                    send_whatsapp_via_twilio(actor_id, f"✅ Import terminé. Lignes traitées: {len(items)}")
+                except Exception as e:
+                    send_whatsapp_via_twilio(actor_id, f"❌ Import échoué: {e}")
+                finally:
+                    _import_clear(actor_id)
+
+            threading.Thread(target=import_job, daemon=True).start()
+            return ack
+
+        return PlainTextResponse(twiml_message("Réponds OUI pour confirmer l’import ou NON pour annuler."), media_type="application/xml")
+
+    num_media = int((NumMedia or "0") or "0")
+    if num_media > 0 and MediaUrl0:
+        # si tu veux empêcher import quand clarification en cours:
+        if _clarify_get(actor_id) or _pending_get(actor_id):
+            return PlainTextResponse(
+                twiml_message("⚠️ Tu as une action en cours (clarification/confirmation). Réponds d’abord, puis renvoie le fichier."),
+                media_type="application/xml",
+                status_code=200,
+            )
+
+        ack = PlainTextResponse(twiml_message("📎 Fichier reçu. Analyse en cours…"), media_type="application/xml", status_code=200)
+
+        def media_job():
+            try:
+                data, ct_hdr = download_twilio_media(MediaUrl0)
+                ct = (MediaContentType0 or ct_hdr or "").lower()
+
+                # XLSX
+                if "spreadsheetml.sheet" in ct or ct.endswith(".xlsx"):
+                    items = parse_xlsx_expenses(data)
+
+                    # petit résumé + confirmation
+                    inserts = sum(1 for x in items if not x.get("depense_id"))
+                    updates = sum(1 for x in items if x.get("depense_id"))
+                    _import_set(actor_id, items)
+
+                    send_whatsapp_via_twilio(
+                        actor_id,
+                        "📊 Import Excel détecté.\n"
+                        f"- Lignes: {len(items)}\n"
+                        f"- Nouvelles dépenses: {inserts}\n"
+                        f"- Mises à jour (depense_id présent): {updates}\n\n"
+                        "Confirmer l’import ? ✅ OUI / ❌ NON"
+                    )
+                    return
+
+                # PDF
+                if "pdf" in ct:
+                    txt = extract_pdf_text(data)
+                    if not txt:
+                        send_whatsapp_via_twilio(actor_id, "❌ PDF scanné (pas de texte). OCR non activé pour l’instant.")
+                        return
+
+                    cmd = (
+                        "Analyse cette facture et crée une facture correspondante. "
+                        "Voici le contenu extrait:\n\n"
+                        + txt[:3500]  # limite WhatsApp + sécurité
+                    )
+                    _run_pipeline(actor_id=actor_id, user_text=cmd, original_user_text=cmd)
+                    return
+
+                send_whatsapp_via_twilio(actor_id, f"❌ Format non supporté: {ct or 'inconnu'}. Envoie un PDF texte ou un XLSX.")
+            except Exception as e:
+                send_whatsapp_via_twilio(actor_id, f"❌ Erreur analyse fichier: {e}")
+
+        threading.Thread(target=media_job, daemon=True).start()
+        return ack
+    if not user_text:
+        return PlainTextResponse(twiml_message("Message vide."), media_type="application/xml", status_code=200)
 
     # =====================================================
     # 0) Clarification flow FIRST (multi-step via /continue)
@@ -1052,7 +1337,7 @@ def whatsapp_webhook(
             )
 
         # Sinon: on continue le plan via /continue
-        ack = PlainTextResponse(twiml_message("✅ Reçu. Je continue…"), media_type="application/xml", status_code=200)
+        ack = PlainTextResponse(twiml_message(ux_ack("continuing")), media_type="application/xml", status_code=200)
 
         def continue_job():
             try:
@@ -1138,7 +1423,7 @@ def whatsapp_webhook(
 
         if _CONFIRM_YES.match(user_text):
             ack = PlainTextResponse(
-                twiml_message("✅ Confirmation reçue. J’exécute la requête…"),
+                twiml_message(ux_ack("executing")),
                 media_type="application/xml",
                 status_code=200,
             )
@@ -1173,7 +1458,7 @@ def whatsapp_webhook(
 
     # Immediate ACK to Twilio
     ack = PlainTextResponse(
-        twiml_message("⏳ Requête reçue. Je traite et je reviens vers toi…"),
+        twiml_message(ux_ack("processing")),
         media_type="application/xml",
         status_code=200,
     )
@@ -1243,7 +1528,6 @@ def _execute_plan(actor_id: str, user_text: str, plan: Dict[str, Any]) -> None:
 
     status_code, resp = post_json_safe(f"{SQL_EXECUTOR_URL.rstrip('/')}/execute", exec_payload)
 
-    # ✅ succès
     if 200 <= status_code < 300:
         result = resp
         if result.get("status") != "executed":
@@ -1256,8 +1540,20 @@ def _execute_plan(actor_id: str, user_text: str, plan: Dict[str, Any]) -> None:
             return
 
         _send_result_via_writer(actor_id, user_text, plan, result)
+
+        imp = _import_get(actor_id)
+        if imp and imp.get("active"):
+            with _PENDING_IMPORT_LOCK:
+                cur = _PENDING_IMPORT.get(actor_id)
+                if cur:
+                    cur["idx"] = int(cur.get("idx") or 0) + 1
+
+            # lancer la suite en arrière-plan (sinon bloque)
+            threading.Thread(target=_import_process_next, args=(actor_id,), daemon=True).start()
+
         _user_ctx_clear(actor_id)
         return
+
 
     # ❌ erreur (ex: 409 budget dépassé)
     detail = resp.get("detail", resp)
@@ -1334,6 +1630,16 @@ def _send_result_via_writer(actor_id: str, user_text: str, plan: Dict[str, Any],
         send_whatsapp_via_twilio(actor_id, txt)
         return
 
+    n = result.get("affected_rows") or 0
+    if op == "INSERT":
+        msg = f"✅ Ajout effectué. {n} élément(s) créé(s)."
+    elif op == "UPDATE":
+        msg = f"✅ Mise à jour effectuée. {n} élément(s) modifié(s)."
+    elif op == "DELETE":
+        msg = f"✅ Suppression effectuée. {n} élément(s) supprimé(s)."
+    else:
+        msg = f"✅ Terminé. {n} ligne(s) affectée(s)."
+
     writer_payload = {
         "request_id": str(uuid.uuid4()),
         "lang": lang,
@@ -1342,7 +1648,7 @@ def _send_result_via_writer(actor_id: str, user_text: str, plan: Dict[str, Any],
         "operation": op or "EXECUTED",
         "rows": [],
         "columns": [],
-        "user_message": f"✅ {op} exécuté. affected_rows={result.get('affected_rows')}",
+        "user_message": msg,
     }
     txt = call_response_writer(writer_payload) or f"✅ {op} exécuté. affected_rows={result.get('affected_rows')}"
     send_whatsapp_via_twilio(actor_id, txt)

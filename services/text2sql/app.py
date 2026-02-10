@@ -2758,7 +2758,8 @@ def continue_pending_plan(
 ) -> Tuple[Optional[str], List[Any], Dict[str, Any], Clarification, PendingPlan, List[str]]:
     notes: List[str] = []
     lang = context.get("lang", "fr")
-
+    if (pending.mode or "").lower() == "import":
+            return continue_import_session(pending, user_input, context)
 
     if pending.intent == "REPLAY_ORIGINAL_AFTER_TENANT":
         original = context.get("original_user_input") or ""
@@ -3313,6 +3314,10 @@ def continue_pending_plan(
                 filled.pop("compte_id", None)
                 pending.filled = filled
                 notes.append(f"compte_id incompatible (compte_eid={compte_eid}) => re-clarification")
+        if "compte_id" not in filled and context.get("prefill_compte_choice"):
+            filled["compte_id"] = int(context["prefill_compte_choice"])
+            pending.filled = filled
+            context.pop("prefill_compte_choice", None)
 
         if "compte_id" not in filled:
             compte_q = (entities.get("compte_query") or "").strip()
@@ -3714,6 +3719,73 @@ def continue_pending_plan(
         field=None,
         message="Je ne sais pas continuer ce plan (intent non supportée). Reformule la demande.",
     ), pending, notes
+
+
+def _extract_account_query_from_row(row_text: str) -> Optional[str]:
+    m = re.search(r'compte\s*["“](.+?)["”]', row_text or "", flags=re.I)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"\bdepuis\s+le\s+compte\s+([^\n\r,.!?]+)", row_text or "", flags=re.I)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def continue_import_session(
+    pending: PendingPlan,
+    user_input: str,
+    context: Dict[str, Any],
+):
+    notes: List[str] = ["import_session"]
+    entities = dict(pending.entities or {})
+
+    rows: List[str] = entities.get("rows", []) or []
+    row_idx = int(entities.get("row_idx", 0) or 0)
+    account_map: Dict[str, int] = entities.get("account_map", {}) or {}
+
+    # 0) terminé
+    if row_idx >= len(rows):
+        return None, [], {}, Clarification(needed=False), pending, notes + ["import_done"]
+
+    row_text = rows[row_idx]
+    context["original_user_input"] = row_text  # important pour ton pipeline
+
+    # 1) si l’utilisateur répond à une clarification "compte"
+    last_field = (context.get("last_field") or "").strip()
+    if last_field in ("compte_id", "compte_source_id", "compte_destination_id") and (user_input or "").strip().isdigit():
+        chosen_option = int(user_input.strip())
+        last_account_q = entities.get("last_account_query")
+        if last_account_q:
+            account_map[last_account_q] = chosen_option
+            entities["account_map"] = account_map
+            notes.append(f"account_map[{last_account_q}]={chosen_option}")
+        context["last_field"] = None  # reset
+
+    # 2) si on a déjà choisi un compte pour "Compte EUR", on pré-remplit
+    acc_q = _extract_account_query_from_row(row_text)
+    if acc_q and acc_q in account_map:
+        context["prefill_compte_choice"] = account_map[acc_q]  # on passe le "numéro" choisi
+
+    # 3) exécuter la ligne via ton pipeline existant
+    sql, params, clar, row_pending, row_notes = run_pipeline(row_text, context)
+    notes += row_notes
+
+    # 4) clarification => STOP (on pose 1 question)
+    if clar.needed:
+        if clar.field in ("compte_id", "compte_source_id", "compte_destination_id") and acc_q:
+            entities["last_account_query"] = acc_q
+            pending.entities = entities
+
+        context["last_field"] = clar.field
+        pending.entities = entities
+        return None, [], {}, clar, pending, notes
+
+    # 5) OK => on avance à la prochaine ligne
+    entities["row_idx"] = row_idx + 1
+    pending.entities = entities
+
+    notes.append(f"row_done idx={row_idx}")
+    return sql, params, {}, Clarification(needed=False), pending, notes
 
 
 # =========================================================
