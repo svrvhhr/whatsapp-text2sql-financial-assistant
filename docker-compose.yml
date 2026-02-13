@@ -1,16 +1,22 @@
-# version: "3.9"
-
 services:
-
   # =========================
   # PostgreSQL Database
   # =========================
+  ngrok:
+    image: ngrok/ngrok:latest
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    command: ["http", "api-gateway:8000"]
+    depends_on:
+      - api-gateway
+
   postgres:
     image: postgres:15
     container_name: orionis-postgres
     restart: always
+    env_file:
+      - .env
     environment:
-      POSTGRES_HOST: postgres
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -19,6 +25,11 @@ services:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   # =========================
   # API Gateway (Twilio entrypoint)
@@ -33,17 +44,14 @@ services:
       TEXT2SQL_URL: "http://text2sql:8000"
       SQL_GUARD_URL: "http://sql-guard:8000"
       SQL_EXECUTOR_URL: "http://sql-executor:8000"
-      RESPONSE_WRITER_URL: http://response-writer:8000
+      RESPONSE_WRITER_URL: "http://response-writer:8000"
+      AUDIT_URL: "http://audit:8000"
       DEFAULT_ROLE: "ReadOnly"
-      
     ports:
       - "8000:8000"
     depends_on:
-      - postgres
-      - text2sql
-      - sql-guard
-      - sql-executor
-      - audit
+      postgres:
+        condition: service_healthy
 
   # =========================
   # Text2SQL Service
@@ -57,7 +65,8 @@ services:
     ports:
       - "8001:8000"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
 
   # =========================
   # SQL Guard (Security & Roles)
@@ -68,13 +77,11 @@ services:
     restart: always
     env_file:
       - .env
-    environment:
-      GUARD_AUTO_LIMIT: "0"
-      GUARD_MAX_ROWS: "200"
     ports:
       - "8002:8000"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
 
   # =========================
   # SQL Executor (ONLY DB ACCESS)
@@ -87,14 +94,12 @@ services:
       - .env
     environment:
       SQL_GUARD_URL: "http://sql-guard:8000"
-      AUDIT_URL: http://audit:8000
-      DB_STATEMENT_TIMEOUT_MS: "5000"
-      MAX_RETURN_ROWS: "200"
+      AUDIT_URL: "http://audit:8000"
     ports:
       - "8003:8000"
     depends_on:
-      - postgres
-      - sql-guard
+      postgres:
+        condition: service_healthy
 
   # =========================
   # Audit Service
@@ -105,16 +110,15 @@ services:
     restart: always
     env_file:
       - .env
-    environment:
-      AUDIT_TABLE_NAME: "audit_service_event"
-      AUDIT_AUTO_MIGRATE: "1"
-      LOG_LEVEL: "INFO"
-      AUDIT_TABLE: "audit_service_event"
-    depends_on:
-      - postgres
     ports:
       - "8004:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
+  # =========================
+  # Response Writer
+  # =========================
   response-writer:
     build: ./services/response-writer
     container_name: response-writer
@@ -122,50 +126,43 @@ services:
     env_file:
       - .env
     environment:
-      - WRITER_TIMEOUT_S=12
-      - WRITER_MAX_ITEMS=10
-      - WRITER_MAX_TEXT_CHARS=1200
-
-      - LLM_PROVIDER=openai
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_BASE_URL=https://api.openai.com/v1
-      - OPENAI_MODEL=gpt-4o-mini
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL}"
     ports:
       - "8005:8000"
 
+  # =========================
+  # Audit UI
+  # =========================
   audit-ui:
     build:
       context: ./services/audit-ui
     container_name: audit-ui
+    restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      - AUDIT_API_URL=http://audit:8000
-      - AUDIT_ADMIN_USER=admin
-      - AUDIT_ADMIN_PASS=admin
-      - AUDIT_UI_DEFAULT_RANGE_HOURS=24
-      - AUDIT_UI_DEFAULT_LIMIT=200
-      - AUDIT_UI_TIMEOUT_S=10
+      AUDIT_API_URL: "http://audit:8000"
     depends_on:
       - audit
     ports:
       - "8501:8501"
-    restart: unless-stopped
 
+  # =========================
+  # Test UI Streamlit
+  # =========================
   test-ui-streamlit:
     build:
       context: ./services/test-ui-streamlit
     container_name: test-ui-streamlit
+    restart: always
     env_file:
       - .env
     environment:
-      - API_GATEWAY_SIMULATE_URL=http://api-gateway:8000/simulate
-      - TEST_UI_TIMEOUT_S=30
+      API_GATEWAY_SIMULATE_URL: "http://api-gateway:8000/simulate"
     ports:
       - "8502:8502"
     depends_on:
       - api-gateway
 
-# =========================
-# Persistent Volumes
-# =========================
 volumes:
   postgres_data:

@@ -398,6 +398,8 @@ def _extract_project_query(text: str):
     return q or None
 
 
+
+
 # =========================================================
 # FastAPI
 # =========================================================
@@ -3637,7 +3639,7 @@ def continue_pending_plan(
             return None, [], {}, clar, pending, notes
 
         # 4) montant + devise
-        # ✅ IMPORTANT: si l'user a répondu pendant une clarification, on prend filled d'abord
+        # si l'user a répondu pendant une clarification, on prend filled d'abord
         montant = filled.get("montant")
         devise = (filled.get("devise") or "").strip().upper() or None
 
@@ -3665,7 +3667,7 @@ def continue_pending_plan(
             filled["devise"] = devise
             pending.filled = filled
 
-        # ✅ si l’utilisateur demande USD mais le compte est AED/EUR => pas de boucle, on bloque proprement
+        # si l’utilisateur demande USD mais le compte est AED/EUR => pas de boucle, on bloque proprement
         if devise != src_dev:
             # on refuse avec message clair (pas de clarification)
             raise HTTPException(
@@ -3678,7 +3680,7 @@ def continue_pending_plan(
             #     needed=True,
             #     entity="devise",
             #     field="devise",
-            #     query=devise,  # ✅ plus jamais ""
+            #     query=devise,  ""
             #     suggestions=[{"option": 1, "nom": src_dev}],
             #     message=f"Le transfert doit être en {src_dev} (devise des comptes). Choisis {src_dev}.",
             # ), pending, notes
@@ -3748,7 +3750,7 @@ def continue_import_session(
         return None, [], {}, Clarification(needed=False), pending, notes + ["import_done"]
 
     row_text = rows[row_idx]
-    context["original_user_input"] = row_text  # important pour ton pipeline
+    context["original_user_input"] = row_text 
 
     # 1) si l’utilisateur répond à une clarification "compte"
     last_field = (context.get("last_field") or "").strip()
@@ -3813,7 +3815,7 @@ def convert(req: ConvertRequest):
     resolved: Dict[str, Any] = {}
     notes: List[str] = []
 
-    # ✅ Auto-resolve entreprise_id + role from actor_id (multi-entité)
+    # Auto-resolve entreprise_id + role from actor_id (multi-entité)
     if context.get("entreprise_id") is None and context.get("actor_id"):
         user = get_user_by_actor(context["actor_id"])
         if user:
@@ -3997,7 +3999,7 @@ def convert(req: ConvertRequest):
         sql = (llm.sql or "").strip()
         params = list(llm.params or [])
         # -------------------------------------------------
-        # 🔁 Auto-resolve projet name in DIRECT SELECT SQL
+        # Auto-resolve projet name in DIRECT SELECT SQL
         # -------------------------------------------------
         try:
             entreprise_id = context.get("entreprise_id")
@@ -4013,7 +4015,6 @@ def convert(req: ConvertRequest):
                             sql = re.sub(r"\bp\.nom\s*=\s*%s\b", "p.id = %s", sql, flags=re.I)
                             params[0] = int(matches[0]["id"])
         except Exception as _e:
-            # ne bloque pas la requête si cette étape échoue
             pass
 
 
@@ -4157,7 +4158,7 @@ def continue_plan(req: ContinueRequest):
     if not context.get("last_field") and req.pending_plan and req.pending_plan.intent == "SELECT_PROJECTS":
         context["last_field"] = "entreprise_id"
 
-    # ✅ Cas spécial: si on vient de choisir entreprise_id -> replay analytics si possible
+    # Cas spécial: si on vient de choisir entreprise_id -> replay analytics si possible
     if context.get("last_field") == "entreprise_id" and (req.user_input or "").strip().isdigit():
         context["entreprise_id"] = int(req.user_input.strip())
         context["last_field"] = None
@@ -4193,7 +4194,7 @@ def continue_plan(req: ContinueRequest):
                 pending_plan=pending,
                 notes=notes,
             )
-        # ✅ si pas analytics, relancer le pipeline LLM sur la requête originale
+        # si pas analytics, relancer le pipeline LLM sur la requête originale
         force_plan = should_force_plan(original)
 
         if TEXT2SQL_STUB_LLM:
@@ -4262,7 +4263,7 @@ def continue_plan(req: ContinueRequest):
     )
     notes.extend(notes2)
 
-    # ✅ Si on a encore besoin de préciser -> renvoyer Clarification (et ne PAS toucher sql)
+    # Si on a encore besoin de préciser -> renvoyer Clarification (et ne PAS toucher sql)
     if clarification.needed:
         return SQLPlan(
             request_id=request_id,

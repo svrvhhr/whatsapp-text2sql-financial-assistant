@@ -193,6 +193,17 @@ def _user_ctx_merge(actor_id: str, ctx_updates: Dict[str, Any]) -> None:
 def _user_ctx_clear(actor_id: str) -> None:
     with _USER_CTX_LOCK:
         _USER_CTX.pop(actor_id, None)
+
+def _user_ctx_clear_transient(actor_id: str) -> None:
+    with _USER_CTX_LOCK:
+        ctx = dict(_USER_CTX.get(actor_id) or {})
+        # On garde ce qui doit persister entre requêtes
+        keep = {}
+        for k in ("entreprise_id", "role"):
+            if ctx.get(k) is not None:
+                keep[k] = ctx[k]
+        _USER_CTX[actor_id] = keep
+
 # =========================================================
 # Commands / patterns
 # =========================================================
@@ -1056,22 +1067,17 @@ def _simulate_run_pipeline(actor_id: str, user_text: str) -> str:
 
 @app.post("/simulate", response_model=SimulateOut)
 def simulate(payload: SimulateIn):
-    """
-    Simule WhatsApp sans Twilio.
-    Retourne uniquement le texte final affiché.
-    """
     actor_id = normalize_whatsapp_number(payload.actor_id)
     user_text = (payload.body or "").strip()
     if not user_text:
         return {"reply": "Message vide."}
 
-    # Security prefilter (same as webhook)
+    # Security prefilter
     if SQL_INJECTION_MARKERS_RE.search(user_text):
         return {"reply": "❌ Requête refusée : caractères SQL non autorisés détectés (;, --, /* */). Reformule sans symboles SQL."}
     SQL_DIRECT_RE = re.compile(r"^\s*(select|insert|update|delete|drop|truncate|alter|create)\b", re.I)
     if SQL_DIRECT_RE.match(user_text):
         return {"reply": "❌ SQL brut interdit. Reformule en langage naturel."}
-
 
     # 0) Clarification flow
     clarify = _clarify_get(actor_id)
@@ -1079,78 +1085,62 @@ def simulate(payload: SimulateIn):
         if _CMD_CANCEL.match(user_text):
             _clarify_clear(actor_id)
             return {"reply": "✅ Ok, j’ai annulé."}
-
         if _CMD_SHOW.match(user_text):
             return {"reply": _format_clarification_message(clarify)}
-
         if _CMD_EDIT.match(user_text):
             _clarify_clear(actor_id)
-            return {"reply": "D’accord 🙂 Réécris ta demande en précisant le nom (ex: ‘Migration ERP’)."}
+            return {"reply": "D’accord. Réécris ta demande en précisant le nom (ex: ‘Migration ERP’)."}
 
         suggestions = clarify.get("suggestions") or []
         m = _CHOICE_NUM.match(user_text)
 
-        # Si on a une liste => choix par numéro obligatoire
-        if suggestions:
-            if not m:
-                return {"reply": "Réponds avec un numéro (ex: 1), ou Annuler."}
+        if suggestions and not m:
+            return {"reply": "Réponds avec un numéro (ex: 1), ou Annuler."}
 
+        # choix par numéro
+        if suggestions and m:
             choice = int(m.group(1))
             selected = next((s for s in suggestions if int(s.get("option", -1)) == choice), None)
             if not selected:
                 return {"reply": "Choix invalide. Réponds avec un numéro de la liste, ou Annuler."}
 
-            # ---- IMPORTANT : on fait comme WhatsApp -> /continue ----
             plan = clarify.get("plan") or {}
             pending_plan = clarify.get("pending_plan") or {}
             ctx = dict(clarify.get("context") or {})
             field = clarify.get("field") or ""
             original_text = clarify.get("original_text") or ""
 
-            # last_field sert à Text2SQL pour savoir quoi remplir
             ctx["last_field"] = field
             ctx["original_user_input"] = ctx.get("original_user_input") or original_text
-            ctx["user_input"] = user_text
 
-            # valeur envoyée à /continue (ID pour entités, nom pour enums)
             if field in ("entreprise_id", "projet_id", "compte_id", "client_id", "compte_source_id", "compte_destination_id"):
                 user_value = str(selected.get("id"))
             else:
                 user_value = str(selected.get("nom"))
 
-
-
-            plan2, err = call_text2sql_continue(
-                user_input=user_value,
-                pending_plan=pending_plan,
-                context=ctx,
-            )
-            if plan2 and isinstance(plan2, dict):
-                _user_ctx_merge(actor_id, plan2.get("context") or {})
+            plan2, err = call_text2sql_continue(user_input=user_value, pending_plan=pending_plan, context=ctx)
             if err:
                 _clarify_clear(actor_id)
-                return {"reply": f"Requête refusée (Text2SQL/continue): {err}"}
+                return {"reply": f"❌ Erreur Text2SQL/continue: {err}"}
+
+            _user_ctx_merge(actor_id, plan2.get("context") or {})
 
             clar2 = plan2.get("clarification") or {}
             if clar2.get("needed"):
                 _clarify_update(actor_id, plan2, original_text)
-                stt = _clarify_get(actor_id) or {}
-                msg = _format_clarification_message(stt)
-                return {"reply": msg}
-                        # ✅ Clarification terminée -> on sort du mode clarification
+                return {"reply": _format_clarification_message(_clarify_get(actor_id) or {})}
+
             _clarify_clear(actor_id)
 
-            # ✅ Si write => confirmation
             if plan_needs_confirmation(plan2):
                 _pending_set(actor_id, plan2, original_text)
                 return {"reply": build_confirmation_message(plan2)}
 
-            # ✅ Sinon exécution directe
             reply = _simulate_execute_plan(actor_id, original_text, plan2)
             return {"reply": reply}
 
-
-
+        # sinon valeur libre (pas de suggestions)
+        return {"reply": "Réponds avec un numéro (ex: 1), ou Annuler."}
 
     # 1) Confirmation flow
     pending = _pending_get(actor_id)
@@ -1160,29 +1150,41 @@ def simulate(payload: SimulateIn):
             return {"reply": "✅ Annulé. Rien n’a été exécuté."}
 
         if _CONFIRM_YES.match(user_text):
-            # on passe l’import en mode actif
-            with _PENDING_IMPORT_LOCK:
-                cur = _PENDING_IMPORT.get(actor_id)
-                if cur:
-                    cur["active"] = True
-                    cur["idx"] = int(cur.get("idx") or 0)
+            try:
+                # Import XLSX en attente ?
+                imp = _import_get(actor_id)
+                if imp and not imp.get("active"):
+                    with _PENDING_IMPORT_LOCK:
+                        cur = _PENDING_IMPORT.get(actor_id)
+                        if cur:
+                            cur["active"] = True
+                            cur["idx"] = int(cur.get("idx") or 0)
+                    threading.Thread(target=_import_process_next, args=(actor_id,), daemon=True).start()
+                    return {"reply": "✅ OK. J’importe les lignes…"}
 
-            # ack = PlainTextResponse(twiml_message("✅ OK. J’importe les lignes…"), media_type="application/xml", status_code=200)
+                # Sinon: write normal
+                plan = pending["plan"]
+                original_text = pending.get("user_text") or plan.get("user_input") or ""
+                ctx = plan.get("context") or {}
+                ctx["confirmed"] = True
+                plan["context"] = ctx
 
-            threading.Thread(target=_import_process_next, args=(actor_id,), daemon=True).start()
-            return {"reply": "✅ OK. J’importe les lignes…"}
-
+                reply = _simulate_execute_plan(actor_id, original_text, plan)
+                return {"reply": reply}
+            finally:
+                _pending_clear(actor_id)
 
         return {"reply": "Je n’ai pas compris. Réponds OUI pour confirmer ou NON/ANNULER pour annuler."}
 
-    # 2) Routing (optional)
-    route, immediate_reply = route_message(user_text)
+    # 2) Routing
+    route, immediate = route_message(user_text)
     if route in ("smalltalk", "out_of_scope"):
-        return {"reply": immediate_reply or ""}
+        return {"reply": immediate or ""}
 
     # 3) Normal pipeline
     reply = _simulate_run_pipeline(actor_id, user_text)
     return {"reply": reply}
+
 
 
 @app.get("/whatsapp/webhook")
@@ -1415,39 +1417,45 @@ def whatsapp_webhook(
     # =====================================================
     # 1) Confirmation flow (OUI/NON)
     # =====================================================
+    # 1) Confirmation flow
     pending = _pending_get(actor_id)
     if pending:
         if _CMD_CANCEL.match(user_text) or _CONFIRM_NO.match(user_text):
             _pending_clear(actor_id)
-            return PlainTextResponse(twiml_message("✅ Annulé. Rien n’a été exécuté."), media_type="application/xml", status_code=200)
+            return {"reply": "✅ Annulé. Rien n’a été exécuté."}
 
         if _CONFIRM_YES.match(user_text):
-            ack = PlainTextResponse(
-                twiml_message(ux_ack("executing")),
-                media_type="application/xml",
-                status_code=200,
-            )
+            # 1) Si un import XLSX est en cours (et attend l'activation), on le lance
+            imp = _import_get(actor_id)
+            if imp and not imp.get("active"):
+                with _PENDING_IMPORT_LOCK:
+                    cur = _PENDING_IMPORT.get(actor_id)
+                    if cur:
+                        cur["active"] = True
+                        cur["idx"] = int(cur.get("idx") or 0)
 
-            def confirmed_job():
-                try:
-                    plan = pending["plan"]
-                    ctx = plan.get("context") or {}
-                    ctx["confirmed"] = True
-                    plan["context"] = ctx
-                    _execute_plan(actor_id, pending.get("user_text") or plan.get("user_input") or "", plan)
-                except Exception as e:
-                    send_whatsapp_via_twilio(actor_id, f"❌ Erreur interne: {e}")
-                finally:
-                    _pending_clear(actor_id)
+                # on peut clear le pending (si tu l'utilises aussi pour valider l'import)
+                _pending_clear(actor_id)
 
-            threading.Thread(target=confirmed_job, daemon=True).start()
-            return ack
+                threading.Thread(target=_import_process_next, args=(actor_id,), daemon=True).start()
+                return {"reply": "✅ OK. J’importe les lignes…"}
 
-        return PlainTextResponse(
-            twiml_message("Je n’ai pas compris. Réponds OUI pour confirmer ou NON/ANNULER pour annuler."),
-            media_type="application/xml",
-            status_code=200,
-        )
+            # 2) Sinon: c'est une confirmation d'écriture normale -> exécuter le plan
+            try:
+                plan = pending["plan"]
+                original_text = pending.get("user_text") or plan.get("user_input") or ""
+
+                ctx = plan.get("context") or {}
+                ctx["confirmed"] = True
+                plan["context"] = ctx
+
+                reply = _simulate_execute_plan(actor_id, original_text, plan)
+                return {"reply": reply}
+            finally:
+                _pending_clear(actor_id)
+
+        return {"reply": "Je n’ai pas compris. Réponds OUI pour confirmer ou NON/ANNULER pour annuler."}
+
 
     # =====================================================
     # 2) Routing (smalltalk / out_of_scope / db)
@@ -1551,7 +1559,7 @@ def _execute_plan(actor_id: str, user_text: str, plan: Dict[str, Any]) -> None:
             # lancer la suite en arrière-plan (sinon bloque)
             threading.Thread(target=_import_process_next, args=(actor_id,), daemon=True).start()
 
-        _user_ctx_clear(actor_id)
+        _user_ctx_clear_transient(actor_id)
         return
 
 
@@ -1648,7 +1656,7 @@ def _send_result_via_writer(actor_id: str, user_text: str, plan: Dict[str, Any],
         "operation": op or "EXECUTED",
         "rows": [],
         "columns": [],
-        "user_message": msg,
+        "user_message": f"✅ Terminé. {result.get('affected_rows')} ligne(s) mise(s) à jour.",
     }
     txt = call_response_writer(writer_payload) or f"✅ {op} exécuté. affected_rows={result.get('affected_rows')}"
     send_whatsapp_via_twilio(actor_id, txt)
